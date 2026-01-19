@@ -40,9 +40,11 @@ enum MetaDataValue<'a> {
     BoolVal(bool),
     RawBytes(&'a [u8]),
 }
+mod memtable;
+//use crate::memtable::mem::memtable as mtable;
 fn main() {
-    let x = EntryBuilder::new_entry_without_metadata("key", "value".as_bytes());
-    println!("{:?}", x)
+    let wal = memtable::mem::WalManager::new("tmp.wal").unwrap();
+    println!("wal:{:?}", wal)
 }
 
 /*
