@@ -1,12 +1,44 @@
+use std::collections::BTreeMap;
 const Write_Ahead_Log_File_Name: &str = "Wal.tmp";
+const Tombo_Stone_Byte_Representation: u8 = 0u8;
 pub struct memtable {
     wal: WalManager,
+    in_memory_repr: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+}
+struct transitive_repr {}
+impl transitive_repr {
+    fn new() -> Self {
+        transitive_repr {}
+    }
+    fn to_wal_entry<'a, 'b>(&self, key: &'a [u8], value: WalEntry) -> &'a [u8] {
+        &[3u8]
+    }
+    fn from_wal_entry<'a>() -> &'a [u8] {
+        &[3u8]
+    }
 }
 #[derive(Debug)]
 pub enum memtableError {
     InitError(WalError),
+    WriteAheadLog(WalError),
+    LsmTreeError(lsmTreeError),
 }
-enum Entry<'a> {
+impl From<WalError> for memtableError {
+    fn from(value: WalError) -> Self {
+        Self::WriteAheadLog(value)
+    }
+}
+impl From<lsmTreeError> for memtableError {
+    fn from(value: lsmTreeError) -> Self {
+        Self::LsmTreeError(value)
+    }
+}
+#[derive(Debug)]
+pub enum lsmTreeError {
+    unimplemented(),
+    ErrorFlushing(),
+}
+enum WalEntry<'a> {
     Value(&'a [u8]),
     Tombstone(),
 }
@@ -18,29 +50,51 @@ impl memtable {
         };
         Ok(memtable {
             wal: wal_result.unwrap(),
+            in_memory_repr: BTreeMap::new(),
         })
     }
     // mainly just for testing
     fn with_wal_manager(wal_manager: WalManager) -> Self {
-        memtable { wal: wal_manager }
+        memtable {
+            wal: wal_manager,
+            in_memory_repr: BTreeMap::new(),
+        }
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), memtableError> {
+        if self.should_flush() {
+            self.flush()?
+        }
+        let wal_entry_repr = transitive_repr::new().to_wal_entry(key, WalEntry::Value(value));
+        self.wal.write_entry(wal_entry_repr)?;
+        self.in_memory_repr
+            .insert(key.to_vec(), Some(value.to_vec()));
         Result::Ok(())
     }
     pub fn delete(&mut self, key: &[u8]) -> Result<(), memtableError> {
+        let wal_entry_repr = transitive_repr::new().to_wal_entry(key, WalEntry::Tombstone());
+        self.wal.write_entry(wal_entry_repr)?;
+        self.in_memory_repr.insert(key.to_vec(), None);
         Result::Ok(())
     }
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, memtableError> {
-        Result::Ok(None)
+    pub fn get(&self, key: &[u8]) -> Result<&Option<Vec<u8>>, lsmTreeError> {
+        match self.in_memory_repr.get(key) {
+            None => return Err(lsmTreeError::unimplemented()), // ! if it doesnt exist in memory, read from disk (tbd)
+            Some(value) => Ok(value),
+        }
     }
-    // ! tbd when working on LSM tree
-    fn flush(&mut self) -> Result<(), String> {
+    // write in memory contents out to lsm tree as Level 0
+    fn flush(&mut self) -> Result<(), lsmTreeError> {
         Result::Ok(())
     }
     // read from WAL and reconstruct memtable
-    fn consume_wal() -> Result<(), memtableError> {
+    fn consume_wal(&self) -> Result<(), memtableError> {
         Result::Ok(())
+    }
+    // need to read from config to handle this
+    // checks if conditions are met to flush
+    fn should_flush(&self) -> bool {
+        false
     }
 }
 // This will be useful when we are flushing to disk
