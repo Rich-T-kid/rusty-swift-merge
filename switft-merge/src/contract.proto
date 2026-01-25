@@ -1,12 +1,19 @@
+/*
+things to add:  
+- batch put / delete
+- range get / delete
+
+these are backwards compatible additions so i will add them later
+*/
 syntax = "proto3";
 
-package switftmerge;
+package swiftmerge.v01;
 
 service LSMDB{
   rpc Put(PutRequest) returns (GenericResponse); 
   rpc Delete(DeleteRequest) returns (GenericResponse); 
   rpc Get(GetRequest) returns (GetResponse);
-  rpc WriteMetrics(WriteMetricsRequest) returns (WritemetricsResponse);
+  rpc WriteMetrics(WriteMetricsRequest) returns (WriteMetricsResponse);
   rpc ReadMetrics(ReadMetricsRequest)  returns (ReadMetricsResponse);
 };
 message PutRequest {
@@ -18,8 +25,6 @@ message DeleteRequest{
   bytes key = 1;
 }
 message GenericResponse{
-  bool failed = 1;
-  string error = 2;
 }
 message GetRequest{
   bytes key = 1;
@@ -27,14 +32,14 @@ message GetRequest{
 }
 message FilterParam{
   bool use = 1;
-  repeated string metadata_keys = 2;
+  repeated string metadata_keys = 2; // array of metadata keys to fetch
 }
 message GetResponse{
-  bytes value =1;
+  optional bytes value =1;
   map<string,TypeInfo> metadata = 2; 
 }
 message WriteMetricsRequest{
-  SuccesfulWritesMetric write_metrics = 1;
+  SuccessfulWritesMetric write_metrics = 1;
   AverageLatency avg_latency = 2;
 }
 message AverageLatency{
@@ -42,20 +47,18 @@ message AverageLatency{
   // if mins == 0  => return all results
   uint64 mins = 2; // keep this strictly defined (1 min , 5 , 10 , 30 , 60)
 }
-message SuccesfulWritesMetric{
+message SuccessfulWritesMetric{
   bool use = 1;
   uint64 write_ahead_log = 2;
   uint64 memtable = 3;
   // if mins == 0  => return all results
   uint64 mins = 4; // keep this strictly defined (1 min , 5 , 10 , 30 )
 }
-message WritemetricsResponse{
-  bool success = 1;
-  string error = 2;
-  WriteMetricsResponse write_response = 3;   
+message WriteMetricsResponse{
+  WriteMetrics write_response = 3;   
   AverageLatencyResponse avg_response = 4;
 }
-message WriteMetricsResponse{
+message WriteMetrics{
   uint64 wal_count = 1;
   uint64 memtable_count = 2;
 }
@@ -75,8 +78,6 @@ message ReadStats{
   uint64 lsm_tree_count = 3;
 }
 message ReadMetricsResponse{
-  bool success = 1;
-  string error = 2;
   ReadStatsResponse read_response = 3;   
   AverageLatencyResponse avg_response = 4;
 }
@@ -85,6 +86,7 @@ message ReadStatsResponse{
   uint64 lsm_tree_reads = 2;
   uint64 total_misses =3;
 }
+
 
 // utility 
 message TypeInfo{

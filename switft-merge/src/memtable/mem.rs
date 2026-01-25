@@ -1,14 +1,43 @@
-use std::collections::BTreeMap;
-const Write_Ahead_Log_File_Name: &str = "Wal.tmp";
-const Tombo_Stone_Byte_Representation: u8 = 0u8;
-pub struct memtable {
-    wal: WalManager,
-    in_memory_repr: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+use std::collections::{BTreeMap, HashMap};
+const WRITE_AHEAD_LOG_FILE_NAME: &str = "Wal.tmp";
+const TOMB_STONE_BYTE_REPRESENTATION: u8 = 0u8;
+#[derive(Debug)]
+pub enum TrueTypes {
+    Unspecified,
+    Bool,
+    RawBytes,
+    String,
+    Uint32,
+    Uint64,
+    Int32,
+    Int64,
+    Float32,
+    Double,
 }
-struct transitive_repr {}
-impl transitive_repr {
+#[derive(Debug)]
+pub struct TypeInfoMetadata {
+    pub raw: Vec<u8>,
+    pub true_type: TrueTypes,
+}
+#[derive(Debug)]
+pub struct TableEntry {
+    pub value: Vec<u8>,
+    pub meta_data: Option<HashMap<String, TypeInfoMetadata>>,
+}
+impl TableEntry {
+    fn serialize(&self) -> Vec<u8> {
+        vec![3u8]
+    }
+}
+#[derive(Debug)]
+pub struct Memtable {
+    wal: WalManager,
+    in_memory_repr: BTreeMap<Vec<u8>, Option<TableEntry>>,
+}
+struct TransitiveRepr {}
+impl TransitiveRepr {
     fn new() -> Self {
-        transitive_repr {}
+        TransitiveRepr {}
     }
     fn to_wal_entry<'a, 'b>(&self, key: &'a [u8], value: WalEntry) -> &'a [u8] {
         &[3u8]
@@ -18,77 +47,76 @@ impl transitive_repr {
     }
 }
 #[derive(Debug)]
-pub enum memtableError {
+pub enum MemtableError {
     InitError(WalError),
     WriteAheadLog(WalError),
-    LsmTreeError(lsmTreeError),
+    LsmTreeError(LsmTreeError),
 }
-impl From<WalError> for memtableError {
+impl From<WalError> for MemtableError {
     fn from(value: WalError) -> Self {
         Self::WriteAheadLog(value)
     }
 }
-impl From<lsmTreeError> for memtableError {
-    fn from(value: lsmTreeError) -> Self {
+impl From<LsmTreeError> for MemtableError {
+    fn from(value: LsmTreeError) -> Self {
         Self::LsmTreeError(value)
     }
 }
 #[derive(Debug)]
-pub enum lsmTreeError {
-    unimplemented(),
+pub enum LsmTreeError {
+    Unimplemented(),
     ErrorFlushing(),
 }
 enum WalEntry<'a> {
-    Value(&'a [u8]),
+    Value(&'a TableEntry),
     Tombstone(),
 }
-impl memtable {
-    pub fn new() -> Result<Self, memtableError> {
-        let wal_result = WalManager::new(Write_Ahead_Log_File_Name);
+impl Memtable {
+    pub fn new() -> Result<Self, MemtableError> {
+        let wal_result = WalManager::new(WRITE_AHEAD_LOG_FILE_NAME);
         if let Err(x) = wal_result {
-            return Err(memtableError::InitError(x));
+            return Err(MemtableError::InitError(x));
         };
-        Ok(memtable {
+        Ok(Memtable {
             wal: wal_result.unwrap(),
             in_memory_repr: BTreeMap::new(),
         })
     }
     // mainly just for testing
     fn with_wal_manager(wal_manager: WalManager) -> Self {
-        memtable {
+        Memtable {
             wal: wal_manager,
             in_memory_repr: BTreeMap::new(),
         }
     }
 
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), memtableError> {
+    pub fn put(&mut self, key: &[u8], value: TableEntry) -> Result<(), MemtableError> {
         if self.should_flush() {
             self.flush()?
         }
-        let wal_entry_repr = transitive_repr::new().to_wal_entry(key, WalEntry::Value(value));
+        let wal_entry_repr = TransitiveRepr::new().to_wal_entry(key, WalEntry::Value(&value));
         self.wal.write_entry(wal_entry_repr)?;
-        self.in_memory_repr
-            .insert(key.to_vec(), Some(value.to_vec()));
+        self.in_memory_repr.insert(key.to_vec(), Some(value));
         Result::Ok(())
     }
-    pub fn delete(&mut self, key: &[u8]) -> Result<(), memtableError> {
-        let wal_entry_repr = transitive_repr::new().to_wal_entry(key, WalEntry::Tombstone());
+    pub fn delete(&mut self, key: &[u8]) -> Result<(), MemtableError> {
+        let wal_entry_repr = TransitiveRepr::new().to_wal_entry(key, WalEntry::Tombstone());
         self.wal.write_entry(wal_entry_repr)?;
         self.in_memory_repr.insert(key.to_vec(), None);
         Result::Ok(())
     }
-    pub fn get(&self, key: &[u8]) -> Result<&Option<Vec<u8>>, lsmTreeError> {
+    pub fn get(&self, key: &[u8]) -> Result<&Option<TableEntry>, LsmTreeError> {
         match self.in_memory_repr.get(key) {
-            None => return Err(lsmTreeError::unimplemented()), // ! if it doesnt exist in memory, read from disk (tbd)
+            None => return Err(LsmTreeError::Unimplemented()), // ! if it doesnt exist in memory, read from disk (tbd)
             Some(value) => Ok(value),
         }
     }
     // write in memory contents out to lsm tree as Level 0
-    fn flush(&mut self) -> Result<(), lsmTreeError> {
+    fn flush(&mut self) -> Result<(), LsmTreeError> {
         Result::Ok(())
     }
     // read from WAL and reconstruct memtable
-    fn consume_wal(&self) -> Result<(), memtableError> {
+    fn consume_wal(&self) -> Result<(), MemtableError> {
         Result::Ok(())
     }
     // need to read from config to handle this
@@ -99,7 +127,7 @@ impl memtable {
 }
 // This will be useful when we are flushing to disk
 // output elements in sorted order <low key -> high key)
-impl Iterator for memtable {
+impl Iterator for Memtable {
     type Item = Option<Vec<u8>>;
     fn next(&mut self) -> Option<Self::Item> {
         Some(Some(vec![8u8]))
@@ -122,10 +150,7 @@ impl From<std::io::Error> for WalError {
         WalError::IoErr(e)
     }
 }
-use std::{
-    fs::{self, File, read},
-    io::{ErrorKind, Read, Seek, Write},
-};
+use std::io::{ErrorKind, Read, Seek, Write};
 impl WalManager {
     pub fn new(file_name: &str) -> Result<Self, WalError> {
         let f = match std::fs::File::options()
@@ -165,7 +190,7 @@ impl WalManager {
         println!("(drain) wal is {fs_size} bytes");
         self.f.seek(std::io::SeekFrom::Start(0)).unwrap();
         let mut buf: Vec<u8> = Vec::new();
-        let result = match self.f.read_to_end(&mut buf) {
+        let _ = match self.f.read_to_end(&mut buf) {
             Ok(size) => size,
             Err(err) => return Err(WalError::IoErr(err)),
         };
@@ -199,7 +224,7 @@ impl Iterator for WalIterator {
 mod wal_manager_test {
     use crate::memtable::mem::WalManager;
     use rand::prelude::*;
-    const Wal_manager_test_file_name: &str = "wal_M_test_file";
+    const WAL_MANAGER_TEST_FILE_NAME: &str = "wal_M_test_file";
     fn gen_file_name() -> String {
         let mut int_vec = vec![];
         for _ in 1..3 {
@@ -208,7 +233,7 @@ mod wal_manager_test {
         }
         let single_interger: Vec<String> = int_vec.iter().map(|i| i.to_string()).collect();
         let single_interger = single_interger.join("");
-        format!("{Wal_manager_test_file_name}{}.tmp", single_interger).replace("", "")
+        format!("{WAL_MANAGER_TEST_FILE_NAME}{}.tmp", single_interger).replace("", "")
     }
 
     #[test]
