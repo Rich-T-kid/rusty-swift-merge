@@ -1,0 +1,108 @@
+/*
+things to add:  
+- batch put / delete
+- range get / delete
+
+these are backwards compatible additions so i will add them later
+*/
+syntax = "proto3";
+
+package swiftmerge.v01;
+
+service LSMDB{
+  rpc Put(PutRequest) returns (GenericResponse); 
+  rpc Delete(DeleteRequest) returns (GenericResponse); 
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc WriteMetrics(WriteMetricsRequest) returns (WriteMetricsResponse);
+  rpc ReadMetrics(ReadMetricsRequest)  returns (ReadMetricsResponse);
+};
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+  map<string,TypeInfo> metadata = 3;
+};
+message DeleteRequest{
+  bytes key = 1;
+}
+message GenericResponse{
+}
+message GetRequest{
+  bytes key = 1;
+  FilterParam filter = 2; // optional filter to apply on metadata
+}
+message FilterParam{
+  bool use = 1;
+  repeated string metadata_keys = 2; // array of metadata keys to fetch
+}
+message GetResponse{
+  optional bytes value =1;
+  map<string,TypeInfo> metadata = 2; 
+}
+message WriteMetricsRequest{
+  SuccessfulWritesMetric write_metrics = 1;
+  AverageLatency avg_latency = 2;
+}
+message AverageLatency{
+  bool use = 1;
+  // if mins == 0  => return all results
+  uint64 mins = 2; // keep this strictly defined (1 min , 5 , 10 , 30 , 60)
+}
+message SuccessfulWritesMetric{
+  bool use = 1;
+  uint64 write_ahead_log = 2;
+  uint64 memtable = 3;
+  // if mins == 0  => return all results
+  uint64 mins = 4; // keep this strictly defined (1 min , 5 , 10 , 30 )
+}
+message WriteMetricsResponse{
+  WriteMetrics write_response = 3;   
+  AverageLatencyResponse avg_response = 4;
+}
+message WriteMetrics{
+  uint64 wal_count = 1;
+  uint64 memtable_count = 2;
+}
+message AverageLatencyResponse{
+  uint64 latency = 1;
+}
+message ReadMetricsRequest{
+  ReadStats total_reads = 1;
+  ReadStats total_misses =2;
+  AverageLatency avg_latency = 3;
+  
+}
+message ReadStats{
+  // ! only a miss if it doesnt exist in memtable + lsm tree
+  bool use = 1;
+  uint64 memtable_count = 2;
+  uint64 lsm_tree_count = 3;
+}
+message ReadMetricsResponse{
+  ReadStatsResponse read_response = 3;   
+  AverageLatencyResponse avg_response = 4;
+}
+message ReadStatsResponse{
+  uint64 memtable_reads = 1;
+  uint64 lsm_tree_reads = 2;
+  uint64 total_misses =3;
+}
+
+
+// utility 
+message TypeInfo{
+  bytes raw  = 1;
+  SupportedMetadataTypes true_type = 2;
+}
+enum SupportedMetadataTypes{
+  SUPPORTED_METADATA_TYPES_UNSPECIFIED = 0 ;
+  SUPPORTED_METADATA_TYPES_BOOL = 1;
+  SUPPORTED_METADATA_TYPES_RAW_BYTE = 2;
+  SUPPORTED_METADATA_TYPES_STRING = 3;
+  SUPPORTED_METADATA_TYPES_UINT32 =4;
+  SUPPORTED_METADATA_TYPES_UINT64=5;
+  SUPPORTED_METADATA_TYPES_INT32 =6;
+  SUPPORTED_METADATA_TYPES_INT64=7;
+  SUPPORTED_METADATA_TYPES_FLOAT32=8;
+  SUPPORTED_METADATA_TYPES_DOUBLE=9;
+
+}
