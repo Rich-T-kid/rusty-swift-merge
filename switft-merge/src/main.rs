@@ -9,11 +9,15 @@ fn main() {
     };
     md.insert("region".to_string(), meta_entry);
 
-    let exaple = memtable::mem::TableEntry {
+    let exaple_entry = memtable::mem::TableEntry {
         value: "first mock test".as_bytes().to_vec(),
         meta_data: Some(md),
     };
-    println!("{:?}", exaple)
+    let mut table = memtable::mem::Memtable::new().unwrap();
+    let key = "richards_key".as_bytes();
+    table.put(key, exaple_entry).unwrap();
+    let output = table.get(key).unwrap();
+    println!("{output:?}");
 }
 
 /*
