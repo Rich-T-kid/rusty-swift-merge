@@ -28,3 +28,11 @@ get:key:"richard" -> value:"1" , map:{....} (all elements)
 get:key:"richard", filter:{use:true,metadata_key:["favorite-food"]} -> value:"1",map:{"favorite-food":{bytes:"sushi",type:string}}
 
 */
+
+/*
+TODO: work on the write path of memtable (wal -> memory)
+      work on the read path of memtable (thin abstraction over hashmap)
+
+
+
+*/
