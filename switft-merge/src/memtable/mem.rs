@@ -1,7 +1,10 @@
-use std::collections::{BTreeMap, HashMap};
-const WRITE_AHEAD_LOG_FILE_NAME: &str = "Wal.tmp";
-const TOMB_STONE_BYTE_REPRESENTATION: u8 = 0u8;
-#[derive(Debug)]
+use super::lsm;
+use std::collections::BTreeMap;
+pub const WRITE_AHEAD_LOG_FILE_NAME: &str = "Wal.tmp";
+pub const TOMB_STONE_BYTE_REPRESENTATION: u8 = 255;
+pub const META_DATA_MAP_DOESNT_EXIST: u8 = 0u8;
+pub const META_DATA_MAP_EXIST: u8 = 1u8;
+#[derive(Debug, Clone)]
 pub enum TrueTypes {
     Unspecified,
     Bool,
@@ -14,19 +17,67 @@ pub enum TrueTypes {
     Float32,
     Double,
 }
-#[derive(Debug)]
+impl TrueTypes {
+    pub fn enum_variant_value(&self) -> u8 {
+        match self {
+            TrueTypes::Unspecified => 0u8,
+            TrueTypes::Bool => 1u8,
+            TrueTypes::RawBytes => 2u8,
+            TrueTypes::String => 3u8,
+            TrueTypes::Uint32 => 4u8,
+            TrueTypes::Uint64 => 5u8,
+            TrueTypes::Int32 => 6u8,
+            TrueTypes::Int64 => 7u8,
+            TrueTypes::Float32 => 8u8,
+            TrueTypes::Double => 9u8,
+        }
+    }
+}
+#[derive(Debug, Clone)]
 pub struct TypeInfoMetadata {
     pub raw: Vec<u8>,
     pub true_type: TrueTypes,
 }
+impl TypeInfoMetadata {
+    pub fn new(raw: Vec<u8>, true_type: TrueTypes) -> Self {
+        TypeInfoMetadata { raw, true_type }
+    }
+}
 #[derive(Debug)]
 pub struct TableEntry {
     pub value: Vec<u8>,
-    pub meta_data: Option<HashMap<String, TypeInfoMetadata>>,
+    pub meta_data: Option<BTreeMap<String, TypeInfoMetadata>>,
 }
 impl TableEntry {
-    fn serialize(&self) -> Vec<u8> {
-        vec![3u8]
+    pub fn new(value: Vec<u8>, meta_data: Option<BTreeMap<String, TypeInfoMetadata>>) -> Self {
+        TableEntry { value, meta_data }
+    }
+    pub fn serialize(&self) -> Result<Vec<u8>, io::Error> {
+        // val-len | val |
+        let mut buffer = Vec::new();
+        let val_len = self.value.len() as u32;
+        buffer.write_all(&val_len.to_le_bytes())?;
+        buffer.write_all(&self.value)?;
+        if let Some(md) = &self.meta_data {
+            buffer.write_all(&META_DATA_MAP_EXIST.to_le_bytes())?;
+            for (key, type_info_md) in md {
+                //
+                // str-len | str | raw_len | raw | enum_variant as u8
+                let k_len = key.len();
+                let tp_raw_len = type_info_md.raw.len() as u32;
+                buffer.write_all(&(k_len as u32).to_le_bytes())?;
+                buffer.write_all(key.as_bytes())?;
+                buffer.write_all(&(tp_raw_len as u32).to_le_bytes())?;
+                buffer.write_all(&type_info_md.raw)?;
+                buffer.write_all(&[type_info_md.true_type.enum_variant_value()])?;
+            }
+            return Ok(buffer);
+        }
+        buffer.write_all(&META_DATA_MAP_DOESNT_EXIST.to_le_bytes())?;
+        Ok(buffer)
+    }
+    fn deserialize(disk_bytes: Vec<u8>) -> Self {
+        todo!()
     }
 }
 #[derive(Debug)]
@@ -34,13 +85,43 @@ pub struct Memtable {
     wal: WalManager,
     in_memory_repr: BTreeMap<Vec<u8>, Option<TableEntry>>,
 }
-struct TransitiveRepr {}
+
+pub struct TransitiveRepr {}
 impl TransitiveRepr {
-    fn new() -> Self {
+    pub fn new() -> Self {
         TransitiveRepr {}
     }
-    fn to_wal_entry<'a, 'b>(&self, key: &'a [u8], value: WalEntry) -> &'a [u8] {
-        &[3u8]
+    /*
+    format of entry is key-length | key | value-len | value
+    in the case of a tombstone its treated as a regular value but when read into memory its checked against the TOMB_STONE_U32_REPRESENTATION constant. if the value matches its interpreted as a tombstone
+    this has a very low likely hood that a value is also this enum but thats a risk we will allow.
+    if this value does not match the constant its proccesed as a table_entry
+     */
+    pub fn to_wal_entry<'a>(
+        &self,
+        buffer: &mut Vec<u8>,
+        key: &'a [u8],
+        value: WalEntry,
+    ) -> io::Result<()> {
+        let key_len = key.len() as u32;
+        buffer.write_all(&key_len.to_le_bytes())?;
+        buffer.write_all(key)?;
+        match value {
+            WalEntry::Tombstone() => {
+                buffer.write_all(&1u8.to_le_bytes())?;
+                buffer.write_all(&TOMB_STONE_BYTE_REPRESENTATION.to_le_bytes())?;
+                return Ok(());
+                // simple write path,     key-len | key | 4 |tombstone marker (0)
+            }
+            WalEntry::Value(table_entry) => {
+                let contents = table_entry.serialize()?;
+                let value_size = contents.len() as u32;
+                buffer.write_all(&value_size.to_le_bytes())?;
+                buffer.write_all(&contents)?;
+                return Ok(());
+                // key-len | key | {value-len} | value
+            }
+        }
     }
     fn from_wal_entry<'a>() -> &'a [u8] {
         &[3u8]
@@ -50,24 +131,29 @@ impl TransitiveRepr {
 pub enum MemtableError {
     InitError(WalError),
     WriteAheadLog(WalError),
-    LsmTreeError(LsmTreeError),
+    LsmTreeError(lsm::LsmTreeError),
 }
 impl From<WalError> for MemtableError {
     fn from(value: WalError) -> Self {
         Self::WriteAheadLog(value)
     }
 }
-impl From<LsmTreeError> for MemtableError {
-    fn from(value: LsmTreeError) -> Self {
+impl From<std::io::Error> for MemtableError {
+    fn from(value: std::io::Error) -> Self {
+        MemtableError::WriteAheadLog(WalError::IoErr(value))
+    }
+}
+impl From<lsm::LsmTreeError> for MemtableError {
+    fn from(value: lsm::LsmTreeError) -> Self {
         Self::LsmTreeError(value)
     }
 }
-#[derive(Debug)]
+/*#[derive(Debug)]
 pub enum LsmTreeError {
     Unimplemented(),
     ErrorFlushing(),
-}
-enum WalEntry<'a> {
+}*/
+pub enum WalEntry<'a> {
     Value(&'a TableEntry),
     Tombstone(),
 }
@@ -94,25 +180,27 @@ impl Memtable {
         if self.should_flush() {
             self.flush()?
         }
-        let wal_entry_repr = TransitiveRepr::new().to_wal_entry(key, WalEntry::Value(&value));
-        self.wal.write_entry(wal_entry_repr)?;
+        let mut wal_entry_repr = Vec::new();
+        TransitiveRepr::new().to_wal_entry(&mut wal_entry_repr, key, WalEntry::Value(&value))?;
+        self.wal.write_entry(wal_entry_repr.as_slice())?;
         self.in_memory_repr.insert(key.to_vec(), Some(value));
         Result::Ok(())
     }
     pub fn delete(&mut self, key: &[u8]) -> Result<(), MemtableError> {
-        let wal_entry_repr = TransitiveRepr::new().to_wal_entry(key, WalEntry::Tombstone());
-        self.wal.write_entry(wal_entry_repr)?;
+        let mut wal_entry_repr = Vec::new();
+        TransitiveRepr::new().to_wal_entry(&mut wal_entry_repr, key, WalEntry::Tombstone())?;
+        self.wal.write_entry(wal_entry_repr.as_slice())?;
         self.in_memory_repr.insert(key.to_vec(), None);
         Result::Ok(())
     }
-    pub fn get(&self, key: &[u8]) -> Result<&Option<TableEntry>, LsmTreeError> {
+    pub fn get(&self, key: &[u8]) -> Result<&Option<TableEntry>, lsm::LsmTreeError> {
         match self.in_memory_repr.get(key) {
-            None => return Err(LsmTreeError::Unimplemented()), // ! if it doesnt exist in memory, read from disk (tbd)
+            None => return Err(lsm::LsmTreeError::Unimplemented()), // ! if it doesnt exist in memory, read from disk (tbd)
             Some(value) => Ok(value),
         }
     }
     // write in memory contents out to lsm tree as Level 0
-    fn flush(&mut self) -> Result<(), LsmTreeError> {
+    fn flush(&mut self) -> Result<(), lsm::LsmTreeError> {
         Result::Ok(())
     }
     // read from WAL and reconstruct memtable
@@ -150,7 +238,7 @@ impl From<std::io::Error> for WalError {
         WalError::IoErr(e)
     }
 }
-use std::io::{ErrorKind, Read, Seek, Write};
+use std::io::{self, ErrorKind, Read, Seek, Write};
 impl WalManager {
     pub fn new(file_name: &str) -> Result<Self, WalError> {
         let f = match std::fs::File::options()
