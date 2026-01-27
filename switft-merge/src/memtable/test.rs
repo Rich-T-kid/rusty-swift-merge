@@ -1,8 +1,7 @@
-use super::mem;
 #[cfg(test)]
 mod serialize_test {
     mod table_entry_serialize_test {
-        use std::{collections::HashMap, io::Write};
+        use std::{collections::BTreeMap, io::Write};
 
         use crate::memtable::mem::{
             self, META_DATA_MAP_DOESNT_EXIST, META_DATA_MAP_EXIST, TableEntry, TypeInfoMetadata,
@@ -22,16 +21,20 @@ mod serialize_test {
             let value_bytes = "value_1";
             let example_entry = TableEntry::new(value_bytes.as_bytes().to_vec(), None);
             let mut expect = Vec::new();
-            expect.write_all((value_bytes.len() as u32).to_le_bytes().as_slice());
-            expect.write_all(value_bytes.as_bytes());
-            expect.write_all(META_DATA_MAP_DOESNT_EXIST.to_le_bytes().as_slice());
+            expect
+                .write_all((value_bytes.len() as u32).to_le_bytes().as_slice())
+                .unwrap();
+            expect.write_all(value_bytes.as_bytes()).unwrap();
+            expect
+                .write_all(META_DATA_MAP_DOESNT_EXIST.to_le_bytes().as_slice())
+                .unwrap();
             let out = example_entry.serialize().unwrap();
             println!("expect:{:?} , got: {:?}", expect, out);
             assert_eq!(expect, out)
         }
         #[test]
-        fn test_string_key_serilization() {
-            let mut meta_data_table = HashMap::new();
+        fn test_string_key_serialization() {
+            let mut meta_data_table = BTreeMap::new();
             let k1 = "host";
             let k2 = "prod";
             let k3 = "request_rate/second";
@@ -56,24 +59,34 @@ mod serialize_test {
                 Some(meta_data_table.clone()),
             );
             let mut expect = Vec::new();
-            expect.write_all((value_bytes.len() as u32).to_le_bytes().as_slice());
-            expect.write_all(value_bytes.as_bytes());
-            expect.write_all(META_DATA_MAP_EXIST.to_le_bytes().as_slice());
+            expect
+                .write_all((value_bytes.len() as u32).to_le_bytes().as_slice())
+                .unwrap();
+            expect.write_all(value_bytes.as_bytes()).unwrap();
+            expect
+                .write_all(META_DATA_MAP_EXIST.to_le_bytes().as_slice())
+                .unwrap();
             // key value pairs
             for (k, v) in meta_data_table {
                 // key-len | key | raw-len | raw | enum_varient
-                expect.write_all((k.len() as u32).to_le_bytes().as_slice());
-                expect.write_all(k.as_bytes());
-                expect.write_all((v.raw.len() as u32).to_le_bytes().as_slice());
-                expect.write_all(&v.raw);
-                expect.write_all(vec![v.true_type.enum_variant_value()].as_slice());
+                expect
+                    .write_all((k.len() as u32).to_le_bytes().as_slice())
+                    .unwrap();
+                expect.write_all(k.as_bytes()).unwrap();
+                expect
+                    .write_all((v.raw.len() as u32).to_le_bytes().as_slice())
+                    .unwrap();
+                expect.write_all(&v.raw).unwrap();
+                expect
+                    .write_all(vec![v.true_type.enum_variant_value()].as_slice())
+                    .unwrap();
             }
             let result = example_entry.serialize().unwrap();
             println!("expect:{:?}\nresult:{:?}", expect, result);
             assert_eq!(expect, result)
         }
         #[test]
-        fn test_raw_bytes_serilization() {
+        fn test_raw_bytes_serialization() {
             let raw_string = "us-east-1".as_bytes().to_vec();
             let raw_bool = 1u8.to_ne_bytes().as_slice().to_vec();
             let raw_int32 = 3042i32.to_le_bytes().as_slice().to_vec();
@@ -118,12 +131,18 @@ mod serialize_test {
             let mut buffer: Vec<u8> = Vec::new();
             let key_1 = &1u8.to_le_bytes();
             let value = WalEntry::Tombstone();
-            TransitiveRepr::new().to_wal_entry(&mut buffer, key_1, value);
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key_1, value)
+                .unwrap();
             let mut expected = Vec::new();
-            expected.write_all((key_1.len() as u32).to_le_bytes().as_slice());
-            expected.write_all(key_1);
-            expected.write_all(&4u32.to_le_bytes());
-            expected.write_all(&TOMB_STONE_BYTE_REPRESENTATION.to_le_bytes());
+            expected
+                .write_all((key_1.len() as u32).to_le_bytes().as_slice())
+                .unwrap();
+            expected.write_all(key_1).unwrap();
+            expected.write_all(&1u8.to_le_bytes()).unwrap();
+            expected
+                .write_all(&TOMB_STONE_BYTE_REPRESENTATION.to_le_bytes())
+                .unwrap();
             println!("expected:{:?}\nbuffer:{:?}", expected, buffer);
             assert_eq!(expected, buffer)
         }
@@ -133,12 +152,18 @@ mod serialize_test {
             let key_1 = &1u8.to_le_bytes();
             let tb_entry = TableEntry::new("one piece is great".as_bytes().to_vec(), None);
             let serialized = tb_entry.serialize().unwrap();
-            TransitiveRepr::new().to_wal_entry(&mut buffer, key_1, WalEntry::Value(&tb_entry));
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key_1, WalEntry::Value(&tb_entry))
+                .unwrap();
             let mut expected = Vec::new();
-            expected.write_all((key_1.len() as u32).to_le_bytes().as_slice());
-            expected.write_all(key_1);
-            expected.write_all((serialized.len() as u32).to_le_bytes().as_slice());
-            expected.write_all(&serialized);
+            expected
+                .write_all((key_1.len() as u32).to_le_bytes().as_slice())
+                .unwrap();
+            expected.write_all(key_1).unwrap();
+            expected
+                .write_all((serialized.len() as u32).to_le_bytes().as_slice())
+                .unwrap();
+            expected.write_all(&serialized).unwrap();
             println!("expected:{:?}\nbuffer:{:?}", expected, buffer);
             assert_eq!(expected, buffer)
         }

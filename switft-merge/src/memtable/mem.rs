@@ -1,9 +1,9 @@
 use super::lsm;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 pub const WRITE_AHEAD_LOG_FILE_NAME: &str = "Wal.tmp";
-pub const TOMB_STONE_BYTE_REPRESENTATION: u32 = 0u32;
-pub const META_DATA_MAP_DOESNT_EXIST: i32 = -1i32;
-pub const META_DATA_MAP_EXIST: i32 = -2i32;
+pub const TOMB_STONE_BYTE_REPRESENTATION: u8 = 255;
+pub const META_DATA_MAP_DOESNT_EXIST: u8 = 0u8;
+pub const META_DATA_MAP_EXIST: u8 = 1u8;
 #[derive(Debug, Clone)]
 pub enum TrueTypes {
     Unspecified,
@@ -46,40 +46,38 @@ impl TypeInfoMetadata {
 #[derive(Debug)]
 pub struct TableEntry {
     pub value: Vec<u8>,
-    pub meta_data: Option<HashMap<String, TypeInfoMetadata>>,
+    pub meta_data: Option<BTreeMap<String, TypeInfoMetadata>>,
 }
 impl TableEntry {
-    pub fn new(value: Vec<u8>, meta_data: Option<HashMap<String, TypeInfoMetadata>>) -> Self {
+    pub fn new(value: Vec<u8>, meta_data: Option<BTreeMap<String, TypeInfoMetadata>>) -> Self {
         TableEntry { value, meta_data }
     }
     pub fn serialize(&self) -> Result<Vec<u8>, io::Error> {
         // val-len | val |
         let mut buffer = Vec::new();
         let val_len = self.value.len() as u32;
-        buffer.write_all(val_len.to_le_bytes().as_slice())?;
-        buffer.write_all(self.value.as_slice())?;
+        buffer.write_all(&val_len.to_le_bytes())?;
+        buffer.write_all(&self.value)?;
         if let Some(md) = &self.meta_data {
-            buffer.write_all(META_DATA_MAP_EXIST.to_le_bytes().as_slice())?;
+            buffer.write_all(&META_DATA_MAP_EXIST.to_le_bytes())?;
             for (key, type_info_md) in md {
+                //
                 // str-len | str | raw_len | raw | enum_variant as u8
                 let k_len = key.len();
                 let tp_raw_len = type_info_md.raw.len() as u32;
-                buffer.write_all((k_len as u32).to_le_bytes().as_slice())?;
+                buffer.write_all(&(k_len as u32).to_le_bytes())?;
                 buffer.write_all(key.as_bytes())?;
-                buffer.write_all((tp_raw_len as u32).to_le_bytes().as_slice())?;
+                buffer.write_all(&(tp_raw_len as u32).to_le_bytes())?;
                 buffer.write_all(&type_info_md.raw)?;
-                buffer.write_all(vec![type_info_md.true_type.enum_variant_value()].as_slice())?;
+                buffer.write_all(&[type_info_md.true_type.enum_variant_value()])?;
             }
             return Ok(buffer);
         }
-        buffer.write_all(META_DATA_MAP_DOESNT_EXIST.to_le_bytes().as_slice())?;
+        buffer.write_all(&META_DATA_MAP_DOESNT_EXIST.to_le_bytes())?;
         Ok(buffer)
     }
     fn deserialize(disk_bytes: Vec<u8>) -> Self {
-        TableEntry {
-            value: vec![],
-            meta_data: None,
-        }
+        todo!()
     }
 }
 #[derive(Debug)]
@@ -93,6 +91,12 @@ impl TransitiveRepr {
     pub fn new() -> Self {
         TransitiveRepr {}
     }
+    /*
+    format of entry is key-length | key | value-len | value
+    in the case of a tombstone its treated as a regular value but when read into memory its checked against the TOMB_STONE_U32_REPRESENTATION constant. if the value matches its interpreted as a tombstone
+    this has a very low likely hood that a value is also this enum but thats a risk we will allow.
+    if this value does not match the constant its proccesed as a table_entry
+     */
     pub fn to_wal_entry<'a>(
         &self,
         buffer: &mut Vec<u8>,
@@ -100,19 +104,19 @@ impl TransitiveRepr {
         value: WalEntry,
     ) -> io::Result<()> {
         let key_len = key.len() as u32;
-        buffer.write_all(key_len.to_le_bytes().as_slice())?;
+        buffer.write_all(&key_len.to_le_bytes())?;
         buffer.write_all(key)?;
         match value {
             WalEntry::Tombstone() => {
-                buffer.write_all(4u32.to_le_bytes().as_slice())?;
-                buffer.write_all(TOMB_STONE_BYTE_REPRESENTATION.to_le_bytes().as_slice())?;
+                buffer.write_all(&1u8.to_le_bytes())?;
+                buffer.write_all(&TOMB_STONE_BYTE_REPRESENTATION.to_le_bytes())?;
                 return Ok(());
                 // simple write path,     key-len | key | 4 |tombstone marker (0)
             }
             WalEntry::Value(table_entry) => {
-                let contents = table_entry.serialize().unwrap();
+                let contents = table_entry.serialize()?;
                 let value_size = contents.len() as u32;
-                buffer.write_all(value_size.to_le_bytes().as_slice())?;
+                buffer.write_all(&value_size.to_le_bytes())?;
                 buffer.write_all(&contents)?;
                 return Ok(());
                 // key-len | key | {value-len} | value

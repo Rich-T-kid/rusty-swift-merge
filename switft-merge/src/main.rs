@@ -1,8 +1,8 @@
 mod memtable;
 use crate::memtable::mem;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 fn main() {
-    let mut md = HashMap::new();
+    let mut md = BTreeMap::new();
     let meta_entry = mem::TypeInfoMetadata {
         raw: 21u32.to_ne_bytes().to_vec(),
         true_type: mem::TrueTypes::Int32,
