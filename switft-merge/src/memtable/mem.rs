@@ -1,10 +1,11 @@
 use super::lsm;
+use core::error;
 use std::collections::BTreeMap;
 pub const WRITE_AHEAD_LOG_FILE_NAME: &str = "Wal.tmp";
 pub const TOMB_STONE_BYTE_REPRESENTATION: u8 = 255;
 pub const META_DATA_MAP_DOESNT_EXIST: u8 = 0u8;
 pub const META_DATA_MAP_EXIST: u8 = 1u8;
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TrueTypes {
     Unspecified,
     Bool,
@@ -33,7 +34,7 @@ impl TrueTypes {
         }
     }
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TypeInfoMetadata {
     pub raw: Vec<u8>,
     pub true_type: TrueTypes,
@@ -43,10 +44,29 @@ impl TypeInfoMetadata {
         TypeInfoMetadata { raw, true_type }
     }
 }
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct TableEntry {
     pub value: Vec<u8>,
     pub meta_data: Option<BTreeMap<String, TypeInfoMetadata>>,
+}
+pub enum DecodingError {
+    IoError(io::Error),
+    MalformedData(String),
+    Empty(),
+}
+impl From<DecodingError> for Box<dyn std::error::Error> {
+    fn from(value: DecodingError) -> Self {
+        match value {
+            DecodingError::IoError(io) => Box::new(io),
+            DecodingError::MalformedData(msg) => {
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+            }
+            DecodingError::Empty() => Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no data to decode",
+            )),
+        }
+    }
 }
 impl TableEntry {
     pub fn new(value: Vec<u8>, meta_data: Option<BTreeMap<String, TypeInfoMetadata>>) -> Self {
@@ -76,7 +96,7 @@ impl TableEntry {
         buffer.write_all(&META_DATA_MAP_DOESNT_EXIST.to_le_bytes())?;
         Ok(buffer)
     }
-    fn deserialize(disk_bytes: Vec<u8>) -> Self {
+    pub fn deserialize(disk_bytes: Vec<u8>) -> Result<Self, DecodingError> {
         todo!()
     }
 }
@@ -123,8 +143,10 @@ impl TransitiveRepr {
             }
         }
     }
-    fn from_wal_entry<'a>() -> &'a [u8] {
-        &[3u8]
+    pub fn from_wal_entry(
+        buf: Vec<u8>,
+    ) -> Result<(Vec<u8>, Option<TableEntry>), Box<dyn std::error::Error>> {
+        Ok((vec![0u8], None))
     }
 }
 #[derive(Debug)]
@@ -182,6 +204,7 @@ impl Memtable {
         }
         let mut wal_entry_repr = Vec::new();
         TransitiveRepr::new().to_wal_entry(&mut wal_entry_repr, key, WalEntry::Value(&value))?;
+
         self.wal.write_entry(wal_entry_repr.as_slice())?;
         self.in_memory_repr.insert(key.to_vec(), Some(value));
         Result::Ok(())
@@ -272,6 +295,13 @@ impl WalManager {
             Err(err) => Err(WalError::IoErr(err)),
         }
     }
+    // ! for now we'll stick to using drain as the main way to consume the WAL and rebuild the
+    // ! memtable, the issue is that this could cause memory strain, as we write all the files contents
+    // ! to a buffer then while this memory buffer exist we iterate across it to build our in memory structs
+    // ! before releasing the memory, so just before the memtable is fully constructed there is (WAL_memory_size * 2) bytes of ram being used
+    // ! this could play a role later when we decided how we want to divy up system resources for different task.
+    // ! also reading/reconstructing the memtable from the WAL should be extremely rare so again for now its fine.
+    // ! possible improvments (read from disk to a medium sized buffer (1-5 MB) and build structs from buffer before refilling from disk, removes the risk of Out Of Memory since at most its the memtable_size + (1-5)MB )
     // consume all the contents of the WAl, this doesnt not delete the current contents of the WAL
     pub fn drain(&mut self) -> Result<Vec<u8>, WalError> {
         let fs_size = self.f.metadata().unwrap().len();

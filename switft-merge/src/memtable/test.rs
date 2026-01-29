@@ -170,5 +170,306 @@ mod serialize_test {
 
         // check the value len is correct
     }
-    mod table_entry_deserialize {}
+}
+mod deserialize_test {
+    mod table_entry_deserialize {
+        use crate::memtable::mem::{TrueTypes, TypeInfoMetadata};
+        use std::collections::BTreeMap;
+
+        use crate::memtable::mem::TableEntry;
+        #[test]
+        fn deserialize_round_trip_empty_md() -> Result<(), Box<dyn std::error::Error>> {
+            let table_entry = TableEntry::new("one piece this week".as_bytes().to_vec(), None);
+            let table_entry_serialization = table_entry.serialize()?;
+            let resulting_deserilization = TableEntry::deserialize(table_entry_serialization)?;
+            assert_eq!(table_entry, resulting_deserilization);
+            Ok(())
+        }
+        #[test]
+        fn deserialize_round_trip_md() -> Result<(), Box<dyn std::error::Error>> {
+            let mut meta_data_table = BTreeMap::new();
+            let k1 = "host";
+            let k2 = "prod";
+            let k3 = "request_rate/second";
+            let raw_1 = "us-east-1".as_bytes().to_vec();
+            let raw_2 = 1u8.to_ne_bytes().as_slice().to_vec();
+            let raw_3 = 3042i32.to_le_bytes().as_slice().to_vec();
+            meta_data_table.insert(
+                String::from(k1),
+                TypeInfoMetadata::new(raw_1, TrueTypes::String),
+            );
+            meta_data_table.insert(
+                String::from(k2),
+                TypeInfoMetadata::new(raw_2, TrueTypes::Bool),
+            );
+            meta_data_table.insert(
+                String::from(k3),
+                TypeInfoMetadata::new(raw_3, TrueTypes::Int32),
+            );
+            let value_bytes = "value_1";
+            let table_entry = TableEntry::new(
+                value_bytes.as_bytes().to_vec(),
+                Some(meta_data_table.clone()),
+            );
+            let table_entry_serialization = table_entry.serialize()?;
+            let resulting_deserilization = TableEntry::deserialize(table_entry_serialization)?;
+            assert_eq!(table_entry, resulting_deserilization);
+            Ok(())
+        }
+        #[test]
+        fn test_invalid_bytes_deserialization() {
+            let invalidBuffer = vec![16u8, 1u8, 2u8, 3u8]; // buffer is short, expects value to be 16 bytes long but it only contains 4 bytes
+            if let Ok(_) = TableEntry::deserialize(invalidBuffer) {
+                panic!("deserialize should have returned an error")
+            }
+        }
+        #[test]
+        fn test_invalid_enum_variant_deserialization() -> Result<(), Box<dyn std::error::Error>> {
+            let mut meta_data_table = BTreeMap::new();
+            let k1 = "host";
+            let raw_1 = "us-east-1".as_bytes().to_vec();
+            meta_data_table.insert(
+                String::from(k1),
+                TypeInfoMetadata::new(raw_1, TrueTypes::String),
+            );
+            let value_bytes = "value_1";
+            let table_entry = TableEntry::new(
+                value_bytes.as_bytes().to_vec(),
+                Some(meta_data_table.clone()),
+            );
+            let mut table_entry_serialization = table_entry.serialize()?;
+            // Corrupt the last byte (enum variant) to an invalid value
+            let last_idx = table_entry_serialization.len() - 1;
+            table_entry_serialization[last_idx] = 255u8; // Invalid enum variant
+
+            if let Ok(_) = TableEntry::deserialize(table_entry_serialization) {
+                panic!("deserialize should have returned an error for invalid enum variant")
+            }
+            Ok(())
+        }
+        #[test]
+        fn test_invalid_enum_variant_multiple_keys() -> Result<(), Box<dyn std::error::Error>> {
+            let mut meta_data_table = BTreeMap::new();
+            let k1 = "host";
+            let k2 = "prod";
+            let raw_1 = "us-east-1".as_bytes().to_vec();
+            let raw_2 = 1u8.to_ne_bytes().as_slice().to_vec();
+            meta_data_table.insert(
+                String::from(k1),
+                TypeInfoMetadata::new(raw_1, TrueTypes::String),
+            );
+            meta_data_table.insert(
+                String::from(k2),
+                TypeInfoMetadata::new(raw_2, TrueTypes::Bool),
+            );
+            let value_bytes = "test_value";
+            let table_entry = TableEntry::new(
+                value_bytes.as_bytes().to_vec(),
+                Some(meta_data_table.clone()),
+            );
+            let mut table_entry_serialization = table_entry.serialize()?;
+            // Corrupt the last byte (enum variant of last metadata entry) to an invalid value
+            let last_idx = table_entry_serialization.len() - 1;
+            table_entry_serialization[last_idx] = 99u8; // Invalid enum variant
+
+            if let Ok(_) = TableEntry::deserialize(table_entry_serialization) {
+                panic!("deserialize should have returned an error for invalid enum variant")
+            }
+            Ok(())
+        }
+    }
+    mod transitive_repr_deserialize {
+        use std::io::Write;
+
+        use crate::memtable::mem::{
+            TOMB_STONE_BYTE_REPRESENTATION, TableEntry, TransitiveRepr, WalEntry,
+        };
+
+        #[test]
+        fn deserialize_round_trip_tombstone() -> Result<(), Box<dyn std::error::Error>> {
+            let mut buffer: Vec<u8> = Vec::new();
+            let key = b"test_key";
+            TransitiveRepr::new().to_wal_entry(&mut buffer, key, WalEntry::Tombstone())?;
+
+            let (deserialized_key, deserialized_value) = TransitiveRepr::from_wal_entry(buffer)?;
+
+            assert_eq!(deserialized_key, key.to_vec());
+            assert_eq!(deserialized_value, None); // Tombstone
+            Ok(())
+        }
+
+        #[test]
+        fn deserialize_round_trip_value() -> Result<(), Box<dyn std::error::Error>> {
+            let mut buffer: Vec<u8> = Vec::new();
+            let key = b"my_key";
+            let table_entry = TableEntry::new("my_value".as_bytes().to_vec(), None);
+            TransitiveRepr::new().to_wal_entry(&mut buffer, key, WalEntry::Value(&table_entry))?;
+
+            let (deserialized_key, deserialized_value) = TransitiveRepr::from_wal_entry(buffer)?;
+
+            assert_eq!(deserialized_key, key.to_vec());
+            assert_eq!(deserialized_value, Some(table_entry));
+            Ok(())
+        }
+
+        #[test]
+        fn deserialize_round_trip_value_with_metadata() -> Result<(), Box<dyn std::error::Error>> {
+            use crate::memtable::mem::{TrueTypes, TypeInfoMetadata};
+            use std::collections::BTreeMap;
+
+            let mut buffer: Vec<u8> = Vec::new();
+            let key = b"server_metric";
+
+            let mut meta_data_table = BTreeMap::new();
+            meta_data_table.insert(
+                String::from("host"),
+                TypeInfoMetadata::new("us-east-1".as_bytes().to_vec(), TrueTypes::String),
+            );
+            meta_data_table.insert(
+                String::from("port"),
+                TypeInfoMetadata::new(8080i32.to_le_bytes().to_vec(), TrueTypes::Int32),
+            );
+
+            let table_entry = TableEntry::new(
+                "active_connections: 42".as_bytes().to_vec(),
+                Some(meta_data_table),
+            );
+
+            TransitiveRepr::new().to_wal_entry(&mut buffer, key, WalEntry::Value(&table_entry))?;
+
+            let (deserialized_key, deserialized_value) = TransitiveRepr::from_wal_entry(buffer)?;
+
+            assert_eq!(deserialized_key, key.to_vec());
+            assert_eq!(deserialized_value, Some(table_entry));
+            Ok(())
+        }
+
+        #[test]
+        fn deserialize_round_trip_large_value() -> Result<(), Box<dyn std::error::Error>> {
+            let mut buffer: Vec<u8> = Vec::new();
+            let key = b"large_data_key";
+            let large_value = vec![42u8; 1024]; // 1KB of data
+            let table_entry = TableEntry::new(large_value, None);
+
+            TransitiveRepr::new().to_wal_entry(&mut buffer, key, WalEntry::Value(&table_entry))?;
+
+            let (deserialized_key, deserialized_value) = TransitiveRepr::from_wal_entry(buffer)?;
+
+            assert_eq!(deserialized_key, key.to_vec());
+            assert_eq!(deserialized_value, Some(table_entry));
+            Ok(())
+        }
+
+        #[test]
+        fn test_key_size_smaller_than_buffer() {
+            // Buffer claims key is 10 bytes but only provides 5 bytes
+            let mut buffer: Vec<u8> = Vec::new();
+            buffer.write_all(&10u32.to_le_bytes()).unwrap(); // key length = 10
+            buffer.write_all(b"short").unwrap(); // only 5 bytes
+            buffer.write_all(&1u32.to_le_bytes()).unwrap(); // value length
+            buffer
+                .write_all(&TOMB_STONE_BYTE_REPRESENTATION.to_le_bytes())
+                .unwrap();
+
+            // TODO: When from_wal_entry is implemented, this should fail
+            if let Ok(_) = TransitiveRepr::from_wal_entry(buffer) {
+                panic!("deserialize should have returned an error for undersized key buffer")
+            }
+        }
+
+        #[test]
+        fn test_key_size_larger_than_buffer() {
+            // Buffer claims key is 100 bytes but buffer is too small
+            let mut buffer: Vec<u8> = Vec::new();
+            buffer.write_all(&100u32.to_le_bytes()).unwrap(); // key length = 100
+            buffer.write_all(b"tiny").unwrap(); // only 4 bytes 
+
+            if let Ok(_) = TransitiveRepr::from_wal_entry(buffer) {
+                panic!("deserialize should have returned an error for oversized key claim")
+            }
+        }
+
+        #[test]
+        fn test_value_size_smaller_than_buffer() {
+            // Proper key but value claims to be larger than actual data
+            let mut buffer: Vec<u8> = Vec::new();
+            let key = b"key";
+            buffer.write_all(&(key.len() as u32).to_le_bytes()).unwrap();
+            buffer.write_all(key).unwrap();
+            buffer.write_all(&50u32.to_le_bytes()).unwrap(); // claims 50 bytes
+            buffer.write_all(b"small_value").unwrap(); // only 11 bytes
+
+            if let Ok(_) = TransitiveRepr::from_wal_entry(buffer) {
+                panic!("deserialize should have returned an error for undersized value buffer")
+            }
+        }
+
+        #[test]
+        fn test_value_size_larger_than_buffer() {
+            // Value length exceeds remaining buffer
+            let mut buffer: Vec<u8> = Vec::new();
+            let key = b"key";
+            buffer.write_all(&(key.len() as u32).to_le_bytes()).unwrap();
+            buffer.write_all(key).unwrap();
+            buffer.write_all(&1000u32.to_le_bytes()).unwrap(); // claims 1000 bytes
+            buffer.write_all(b"val").unwrap(); // only 3 bytes
+
+            if let Ok(_) = TransitiveRepr::from_wal_entry(buffer) {
+                panic!("deserialize should have returned an error for oversized value claim")
+            }
+        }
+
+        #[test]
+        fn test_empty_buffer() {
+            let buffer: Vec<u8> = Vec::new();
+
+            if let Ok(_) = TransitiveRepr::from_wal_entry(buffer) {
+                panic!("deserialize should have returned an error for empty buffer")
+            }
+        }
+
+        #[test]
+        fn test_buffer_with_only_key_length() {
+            // Buffer only contains key length prefix, nothing else
+            let mut buffer: Vec<u8> = Vec::new();
+            buffer.write_all(&5u32.to_le_bytes()).unwrap();
+
+            if let Ok(_) = TransitiveRepr::from_wal_entry(buffer) {
+                panic!("deserialize should have returned an error for incomplete buffer")
+            }
+        }
+
+        #[test]
+        fn test_zero_key_length() {
+            // Edge case: zero-length key
+            let mut buffer: Vec<u8> = Vec::new();
+            buffer.write_all(&0u32.to_le_bytes()).unwrap(); // key length = 0
+            buffer.write_all(&1u32.to_le_bytes()).unwrap(); // value length = 1
+            buffer
+                .write_all(&TOMB_STONE_BYTE_REPRESENTATION.to_le_bytes())
+                .unwrap();
+
+            if let Ok(_) = TransitiveRepr::from_wal_entry(buffer) {
+                panic!(
+                    "deserialize should have returned an error for zero length keys are not valid"
+                )
+            }
+        }
+
+        #[test]
+        fn test_zero_value_length() {
+            // Edge case: zero-length value
+            let mut buffer: Vec<u8> = Vec::new();
+            let key = b"key";
+            buffer.write_all(&(key.len() as u32).to_le_bytes()).unwrap();
+            buffer.write_all(key).unwrap();
+            buffer.write_all(&0u32.to_le_bytes()).unwrap(); // value length = 0
+
+            if let Ok(_) = TransitiveRepr::from_wal_entry(buffer) {
+                panic!(
+                    "deserialize should have returned an error for zero length values are not valid"
+                )
+            }
+        }
+    }
 }
