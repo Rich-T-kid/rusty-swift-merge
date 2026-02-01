@@ -2,22 +2,11 @@ mod memtable;
 use crate::memtable::mem;
 use std::collections::BTreeMap;
 fn main() {
-    let mut md = BTreeMap::new();
-    let meta_entry = mem::TypeInfoMetadata {
-        raw: 21u32.to_ne_bytes().to_vec(),
-        true_type: mem::TrueTypes::Int32,
-    };
-    md.insert("region".to_string(), meta_entry);
-
-    let exaple_entry = memtable::mem::TableEntry {
-        value: "first mock test".as_bytes().to_vec(),
-        meta_data: Some(md),
-    };
-    let mut table = memtable::mem::Memtable::new().unwrap();
-    let key = "richards_key".as_bytes();
-    table.put(key, exaple_entry).unwrap();
-    let output = table.get(key).unwrap();
-    println!("{output:?}");
+    let mut mg = memtable::mem::Memtable::new().unwrap();
+    println!("(Pre memtable): {mg:?}");
+    let content = mg.wal.drain().unwrap();
+    mg.rebuild_memtable(content).unwrap();
+    println!("(post memtable): {mg:?}");
 }
 
 /*
