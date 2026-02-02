@@ -29,7 +29,6 @@ mod serialize_test {
                 .write_all(META_DATA_MAP_DOESNT_EXIST.to_le_bytes().as_slice())
                 .unwrap();
             let out = example_entry.serialize().unwrap();
-            println!("expect:{:?} , got: {:?}", expect, out);
             assert_eq!(expect, out)
         }
         #[test]
@@ -219,9 +218,9 @@ mod deserialize_test {
         }
         #[test]
         fn test_invalid_bytes_deserialization() {
-            let invalidBuffer = vec![16u8, 1u8, 2u8, 3u8];
+            let invalid_buffer = vec![16u8, 1u8, 2u8, 3u8];
             // buffer is short, expects value to be 16 bytes long but it only contains 4 bytes
-            if let Ok(_) = TableEntry::deserialize(invalidBuffer) {
+            if let Ok(_) = TableEntry::deserialize(invalid_buffer) {
                 panic!("deserialize should have returned an error")
             }
         }
@@ -513,7 +512,6 @@ mod deserialize_test {
             buffer.write_all(&(key.len() as u32).to_le_bytes()).unwrap();
             buffer.write_all(key).unwrap();
             buffer.write_all(&0u32.to_le_bytes()).unwrap(); // value length = 0
-            println!("buffer:{:?}", buffer);
             let mut mg = Memtable::new().unwrap();
             let result = mg.rebuild_memtable(buffer);
 
@@ -524,17 +522,264 @@ mod deserialize_test {
             ));
         }
     }
-}
-mod vec_test {
-    #[test]
-    fn vec_reads() {
-        let mut v = Vec::new();
-        for i in 0..25 {
-            v.push(i as u8);
+    mod multi_key_test {
+        use std::io::Write;
+
+        use crate::memtable::mem::{
+            Memtable, MemtableError, TableEntry, TransitiveRepr, TrueTypes, TypeInfoMetadata,
+            WalEntry,
+        };
+        use std::collections::BTreeMap;
+
+        #[test]
+        fn test_rebuild_with_three_simple_keys() {
+            let mut buffer: Vec<u8> = Vec::new();
+
+            // First key-value pair
+            let key1 = b"user:1001";
+            let table_entry1 = TableEntry::new("Alice".as_bytes().to_vec(), None);
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key1, WalEntry::Value(&table_entry1))
+                .unwrap();
+
+            // Second key-value pair
+            let key2 = b"user:1002";
+            let table_entry2 = TableEntry::new("Bob".as_bytes().to_vec(), None);
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key2, WalEntry::Value(&table_entry2))
+                .unwrap();
+
+            // Third key-value pair
+            let key3 = b"user:1003";
+            let table_entry3 = TableEntry::new("Charlie".as_bytes().to_vec(), None);
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key3, WalEntry::Value(&table_entry3))
+                .unwrap();
+            // Rebuild memtable
+            let mut mg = Memtable::new().unwrap();
+            mg.rebuild_memtable(buffer).unwrap();
+
+            // Verify all three keys
+            let result1 = mg.get(key1).unwrap();
+            assert_eq!(*result1, Some(table_entry1));
+
+            let result2 = mg.get(key2).unwrap();
+            assert_eq!(*result2, Some(table_entry2));
+
+            let result3 = mg.get(key3).unwrap();
+            assert_eq!(*result3, Some(table_entry3));
         }
 
-        for wind in v.windows(5) {
-            println!("{wind:?}")
+        #[test]
+        fn test_rebuild_with_four_keys_with_metadata() {
+            let mut buffer: Vec<u8> = Vec::new();
+
+            // First key-value pair with metadata
+            let key1 = b"metric:cpu";
+            let mut meta1 = BTreeMap::new();
+            meta1.insert(
+                String::from("host"),
+                TypeInfoMetadata::new("server-1".as_bytes().to_vec(), TrueTypes::String),
+            );
+            meta1.insert(
+                String::from("port"),
+                TypeInfoMetadata::new(8080i32.to_le_bytes().to_vec(), TrueTypes::Int32),
+            );
+            let table_entry1 = TableEntry::new("85.5%".as_bytes().to_vec(), Some(meta1));
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key1, WalEntry::Value(&table_entry1))
+                .unwrap();
+
+            // Second key-value pair with metadata
+            let key2 = b"metric:memory";
+            let mut meta2 = BTreeMap::new();
+            meta2.insert(
+                String::from("host"),
+                TypeInfoMetadata::new("server-2".as_bytes().to_vec(), TrueTypes::String),
+            );
+            meta2.insert(
+                String::from("region"),
+                TypeInfoMetadata::new("us-west-2".as_bytes().to_vec(), TrueTypes::String),
+            );
+            let table_entry2 = TableEntry::new("4096MB".as_bytes().to_vec(), Some(meta2));
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key2, WalEntry::Value(&table_entry2))
+                .unwrap();
+
+            // Third key-value pair with metadata
+            let key3 = b"metric:disk";
+            let mut meta3 = BTreeMap::new();
+            meta3.insert(
+                String::from("host"),
+                TypeInfoMetadata::new("server-3".as_bytes().to_vec(), TrueTypes::String),
+            );
+            meta3.insert(
+                String::from("used"),
+                TypeInfoMetadata::new(512000i64.to_le_bytes().to_vec(), TrueTypes::Int64),
+            );
+            let table_entry3 = TableEntry::new("2TB".as_bytes().to_vec(), Some(meta3));
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key3, WalEntry::Value(&table_entry3))
+                .unwrap();
+
+            // Fourth key-value pair with metadata
+            let key4 = b"metric:network";
+            let mut meta4 = BTreeMap::new();
+            meta4.insert(
+                String::from("host"),
+                TypeInfoMetadata::new("server-4".as_bytes().to_vec(), TrueTypes::String),
+            );
+            meta4.insert(
+                String::from("active"),
+                TypeInfoMetadata::new(1u8.to_ne_bytes().to_vec(), TrueTypes::Bool),
+            );
+            let table_entry4 = TableEntry::new("100Mbps".as_bytes().to_vec(), Some(meta4));
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key4, WalEntry::Value(&table_entry4))
+                .unwrap();
+
+            // Rebuild memtable
+            let mut mg = Memtable::new().unwrap();
+            mg.rebuild_memtable(buffer).unwrap();
+
+            // Verify all four keys
+            let result1 = mg.get(key1).unwrap();
+            assert_eq!(*result1, Some(table_entry1));
+
+            let result2 = mg.get(key2).unwrap();
+            assert_eq!(*result2, Some(table_entry2));
+
+            let result3 = mg.get(key3).unwrap();
+            assert_eq!(*result3, Some(table_entry3));
+
+            let result4 = mg.get(key4).unwrap();
+            assert_eq!(*result4, Some(table_entry4));
+        }
+
+        #[test]
+        fn test_rebuild_with_mixed_values_and_tombstones() {
+            let mut buffer: Vec<u8> = Vec::new();
+
+            // First key with value
+            let key1 = b"session:abc123";
+            let table_entry1 = TableEntry::new("active".as_bytes().to_vec(), None);
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key1, WalEntry::Value(&table_entry1))
+                .unwrap();
+
+            // Second key with tombstone
+            let key2 = b"session:def456";
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key2, WalEntry::Tombstone())
+                .unwrap();
+
+            // Third key with value
+            let key3 = b"session:ghi789";
+            let table_entry3 = TableEntry::new("pending".as_bytes().to_vec(), None);
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key3, WalEntry::Value(&table_entry3))
+                .unwrap();
+
+            // Rebuild memtable
+            let mut mg = Memtable::new().unwrap();
+            mg.rebuild_memtable(buffer).unwrap();
+
+            // Verify all three keys
+            let result1 = mg.get(key1).unwrap();
+            assert_eq!(*result1, Some(table_entry1));
+
+            let result2 = mg.get(key2).unwrap();
+            assert_eq!(*result2, None); // Tombstone
+
+            let result3 = mg.get(key3).unwrap();
+            assert_eq!(*result3, Some(table_entry3));
+        }
+
+        #[test]
+        fn test_rebuild_with_malformed_third_key() {
+            let mut buffer: Vec<u8> = Vec::new();
+
+            // First key - properly formed
+            let key1 = b"config:timeout";
+            let table_entry1 = TableEntry::new("30s".as_bytes().to_vec(), None);
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key1, WalEntry::Value(&table_entry1))
+                .unwrap();
+
+            // Second key - properly formed
+            let key2 = b"config:retries";
+            let table_entry2 = TableEntry::new("3".as_bytes().to_vec(), None);
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key2, WalEntry::Value(&table_entry2))
+                .unwrap();
+
+            // Third key - malformed: corrupt value length
+            // Write key properly
+            let key3 = b"config:buffer";
+            buffer
+                .write_all(&(key3.len() as u32).to_le_bytes())
+                .unwrap();
+            buffer.write_all(key3).unwrap();
+
+            // Malformed: claim value is 100 bytes but only provide 10
+            buffer.write_all(&100u32.to_le_bytes()).unwrap(); // claims 100 bytes
+            buffer.write_all(b"shortvalue").unwrap(); // only 10 bytes
+
+            // Attempt to rebuild memtable - should fail
+            let mut mg = Memtable::new().unwrap();
+            let result = mg.rebuild_memtable(buffer);
+
+            assert!(result.is_err());
+            assert!(matches!(
+                result.unwrap_err(),
+                MemtableError::WriteAheadLog(_)
+            ));
+        }
+
+        #[test]
+        fn test_rebuild_with_four_tombstones() {
+            let mut buffer: Vec<u8> = Vec::new();
+
+            // First key - tombstone
+            let key1 = b"deleted:user:5001";
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key1, WalEntry::Tombstone())
+                .unwrap();
+
+            // Second key - tombstone
+            let key2 = b"deleted:user:5002";
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key2, WalEntry::Tombstone())
+                .unwrap();
+
+            // Third key - tombstone
+            let key3 = b"deleted:user:5003";
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key3, WalEntry::Tombstone())
+                .unwrap();
+
+            // Fourth key - tombstone
+            let key4 = b"deleted:user:5004";
+            TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key4, WalEntry::Tombstone())
+                .unwrap();
+
+            // Rebuild memtable
+            let mut mg = Memtable::new().unwrap();
+            mg.rebuild_memtable(buffer).unwrap();
+
+            // Verify all four keys are tombstones
+            let result1 = mg.get(key1).unwrap();
+            assert_eq!(*result1, None);
+
+            let result2 = mg.get(key2).unwrap();
+            assert_eq!(*result2, None);
+
+            let result3 = mg.get(key3).unwrap();
+            assert_eq!(*result3, None);
+
+            let result4 = mg.get(key4).unwrap();
+            assert_eq!(*result4, None);
         }
     }
 }

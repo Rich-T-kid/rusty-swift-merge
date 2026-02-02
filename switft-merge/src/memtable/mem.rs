@@ -1,8 +1,5 @@
-use crate::memtable;
-
 use super::lsm;
-use core::error;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 pub const WRITE_AHEAD_LOG_FILE_NAME: &str = "Wal.tmp";
 pub const TOMB_STONE_BYTE_REPRESENTATION: u8 = 255;
 pub const META_DATA_MAP_DOESNT_EXIST: u8 = 0u8;
@@ -133,7 +130,7 @@ impl TableEntry {
         const LEN_SIZE: usize = 4;
         if buffer_size <= LEN_SIZE {
             return Err(malformed_error(
-                "value buffer does not contain a lenth prefix for decoding",
+                "value buffer does not contain a length prefix for decoding",
             ));
         }
         let mut idx = 0;
@@ -155,17 +152,14 @@ impl TableEntry {
         }
         let meta_data_exist = &disk_bytes[idx..idx + 1];
         if meta_data_exist == &[META_DATA_MAP_DOESNT_EXIST] {
-            println!("Meta data doesnt exist");
             return Ok(TableEntry {
                 value: value_bytes,
                 meta_data: None,
             });
         } else {
             idx += 1; // move past meta_data_map_exist byte
-            println!("meta data exist");
             let mut meta_data_hashmap: BTreeMap<String, TypeInfoMetadata> = BTreeMap::new();
             loop {
-                println!("remaining buffer contents: {:?}", &disk_bytes[idx..]);
                 if idx >= buffer_size {
                     break;
                 }
@@ -180,7 +174,7 @@ impl TableEntry {
                 idx += LEN_SIZE;
                 if idx + key_len > buffer_size {
                     return Err(malformed_error(
-                        "meta data buffer doesnt not contain enough bytes to decode key bytes",
+                        "meta data buffer does not contain enough bytes to decode key bytes",
                     ));
                 }
                 let string_val = &disk_bytes[idx..idx + key_len];
@@ -196,7 +190,7 @@ impl TableEntry {
                 idx += LEN_SIZE;
                 if idx + raw_bytes_len > buffer_size {
                     return Err(malformed_error(
-                        "meta data buffer doesnt not contain enough bytes to decode raw bytes",
+                        "meta data buffer does not contain enough bytes to decode raw bytes",
                     ));
                 }
                 let raw_bytes = &disk_bytes[idx..idx + raw_bytes_len];
@@ -359,6 +353,7 @@ impl Memtable {
             return Err(MemtableError::WriteAheadLog(WalError::EmptyWal()));
         }
         let mut curr_idx = 0;
+        let mut tmp_iter = 0;
         // at each step where we access the buffer there needs to be bounds checks,
         // if the bounds check fail then a memtable::Wal::malformed should be returned
         loop {
@@ -402,6 +397,7 @@ impl Memtable {
                 );
             }
             let raw_value = wal_content[curr_idx..curr_idx + val_len].to_vec();
+            curr_idx += val_len;
             let table_entry = {
                 if raw_value == [TOMB_STONE_BYTE_REPRESENTATION] {
                     // this is a tombstone entry so now we can write into mem table with value set to None
@@ -412,8 +408,7 @@ impl Memtable {
                 }
             };
             self.in_memory_repr.insert(table_entry.0, table_entry.1);
-            println!("table:{:?}", self.in_memory_repr);
-            break;
+            tmp_iter += 1;
         }
         Result::Ok(())
     }
@@ -451,7 +446,6 @@ impl From<std::io::Error> for WalError {
     }
 }
 use std::io::{self, ErrorKind, Read, Seek, Write};
-use std::string;
 impl WalManager {
     pub fn new(file_name: &str) -> Result<Self, WalError> {
         let f = match std::fs::File::options()
@@ -495,7 +489,6 @@ impl WalManager {
     // consume all the contents of the WAl, this doesnt not delete the current contents of the WAL
     pub fn drain(&mut self) -> Result<Vec<u8>, WalError> {
         let fs_size = self.f.metadata().unwrap().len();
-        println!("(drain) wal is {fs_size} bytes");
         self.f.seek(std::io::SeekFrom::Start(0)).unwrap();
         let mut buf: Vec<u8> = Vec::new();
         let _ = match self.f.read_to_end(&mut buf) {
@@ -547,7 +540,7 @@ mod wal_manager_test {
     #[test]
     fn test_file_name_construct() {
         let name = gen_file_name();
-        println!("{name}")
+        println!("generated file name:\t{name}")
     }
     #[test]
     fn test_init() {
