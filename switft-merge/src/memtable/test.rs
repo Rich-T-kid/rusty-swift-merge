@@ -461,11 +461,7 @@ mod deserialize_test {
             let mut mg = Memtable::new().unwrap();
             let result = mg.rebuild_memtable(buffer);
 
-            assert!(result.is_err());
-            assert!(matches!(
-                result.unwrap_err(),
-                MemtableError::WriteAheadLog(_)
-            ));
+            assert!(result.is_ok());
         }
 
         #[test]
@@ -780,6 +776,100 @@ mod deserialize_test {
 
             let result4 = mg.get(key4).unwrap();
             assert_eq!(*result4, None);
+        }
+    }
+    mod memtable_recovery_test {
+        use std::collections::BTreeMap;
+
+        use crate::memtable::mem::{Memtable, TableEntry, TrueTypes, TypeInfoMetadata};
+
+        #[test]
+        fn test_memtable_persists_after_drop() {
+            // Create first memtable and insert values
+            let mut mg = Memtable::new().unwrap();
+
+            mg.put(
+                b"user:1001",
+                TableEntry::new("Alice".as_bytes().to_vec(), None),
+            )
+            .unwrap();
+            mg.put(
+                b"user:1002",
+                TableEntry::new("Bob".as_bytes().to_vec(), None),
+            )
+            .unwrap();
+            mg.put(
+                b"user:1003",
+                TableEntry::new("Charlie".as_bytes().to_vec(), None),
+            )
+            .unwrap();
+            mg.put(
+                b"session:abc",
+                TableEntry::new("active".as_bytes().to_vec(), None),
+            )
+            .unwrap();
+            mg.put(
+                b"session:def",
+                TableEntry::new("inactive".as_bytes().to_vec(), None),
+            )
+            .unwrap();
+            mg.put(
+                b"config:timeout",
+                TableEntry::new("30s".as_bytes().to_vec(), None),
+            )
+            .unwrap();
+
+            let mut cpu_metadata = BTreeMap::new();
+            cpu_metadata.insert(
+                String::from("host"),
+                TypeInfoMetadata::new("server-1".as_bytes().to_vec(), TrueTypes::String),
+            );
+            cpu_metadata.insert(
+                String::from("port"),
+                TypeInfoMetadata::new(8080i32.to_le_bytes().to_vec(), TrueTypes::Int32),
+            );
+            mg.put(
+                b"metric:cpu",
+                TableEntry::new("85.5%".as_bytes().to_vec(), Some(cpu_metadata)),
+            )
+            .unwrap();
+
+            let mut memory_metadata = BTreeMap::new();
+            memory_metadata.insert(
+                String::from("host"),
+                TypeInfoMetadata::new("server-2".as_bytes().to_vec(), TrueTypes::String),
+            );
+            memory_metadata.insert(
+                String::from("region"),
+                TypeInfoMetadata::new("us-west-2".as_bytes().to_vec(), TrueTypes::String),
+            );
+            mg.put(
+                b"metric:memory",
+                TableEntry::new("4096MB".as_bytes().to_vec(), Some(memory_metadata)),
+            )
+            .unwrap();
+
+            // Drop the memtable
+            drop(mg);
+
+            // Create a new memtable and verify all keys still exist
+            let mg2 = Memtable::new().unwrap();
+
+            let keys = vec![
+                "user:1001",
+                "user:1002",
+                "user:1003",
+                "session:abc",
+                "session:def",
+                "config:timeout",
+                "metric:cpu",
+                "metric:memory",
+            ];
+
+            for key in keys {
+                let result = mg2.get(key.as_bytes()).unwrap();
+                assert!(result.is_some(), "Key {} should exist after recovery", key);
+            }
         }
     }
 }

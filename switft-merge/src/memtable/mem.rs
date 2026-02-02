@@ -292,14 +292,15 @@ pub enum WalEntry<'a> {
 }
 impl Memtable {
     pub fn new() -> Result<Self, MemtableError> {
-        let wal_result = WalManager::new(WRITE_AHEAD_LOG_FILE_NAME);
-        if let Err(x) = wal_result {
-            return Err(MemtableError::InitError(x));
-        };
-        Ok(Memtable {
-            wal: wal_result.unwrap(),
+        let mut wal_result = WalManager::new(WRITE_AHEAD_LOG_FILE_NAME)?;
+        let wal_contents = wal_result.drain()?;
+
+        let mut mem = Memtable {
+            wal: wal_result,
             in_memory_repr: BTreeMap::new(),
-        })
+        };
+        mem.rebuild_memtable(wal_contents)?;
+        Ok(mem)
     }
     // mainly just for testing
     fn with_wal_manager(wal_manager: WalManager) -> Self {
@@ -345,15 +346,17 @@ impl Memtable {
                 String::from(msg),
             )))
         };
-        println!("wal contents :{:?}\n", wal_content);
         const LEN_SIZE: usize = 4;
         let max_size = wal_content.len();
-        if max_size == 0 || max_size < 4 {
+        if max_size == 0 {
+            // ** first time constructing memtable
+            return Ok(());
+        }
+        if max_size < LEN_SIZE {
             // if no bytes or atleast not enough bytes for the key-len read then return err early
             return Err(MemtableError::WriteAheadLog(WalError::EmptyWal()));
         }
         let mut curr_idx = 0;
-        let mut tmp_iter = 0;
         // at each step where we access the buffer there needs to be bounds checks,
         // if the bounds check fail then a memtable::Wal::malformed should be returned
         loop {
@@ -408,7 +411,6 @@ impl Memtable {
                 }
             };
             self.in_memory_repr.insert(table_entry.0, table_entry.1);
-            tmp_iter += 1;
         }
         Result::Ok(())
     }
