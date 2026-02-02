@@ -4,7 +4,7 @@ pub const WRITE_AHEAD_LOG_FILE_NAME: &str = "Wal.tmp";
 pub const TOMB_STONE_BYTE_REPRESENTATION: u8 = 255;
 pub const META_DATA_MAP_DOESNT_EXIST: u8 = 0u8;
 pub const META_DATA_MAP_EXIST: u8 = 1u8;
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TrueTypes {
     Unspecified,
     Bool,
@@ -32,8 +32,22 @@ impl TrueTypes {
             TrueTypes::Double => 9u8,
         }
     }
+    pub fn to_enum_varient(value: &[u8]) -> Self {
+        match value {
+            &[1u8] => Self::Bool,
+            &[2u8] => Self::RawBytes,
+            &[3u8] => Self::String,
+            &[4u8] => Self::Uint32,
+            &[5u8] => Self::Uint64,
+            &[6u8] => Self::Int32,
+            &[7u8] => Self::Int64,
+            &[8u8] => Self::Float32,
+            &[9u8] => Self::Double,
+            _ => Self::Unspecified,
+        }
+    }
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TypeInfoMetadata {
     pub raw: Vec<u8>,
     pub true_type: TrueTypes,
@@ -43,10 +57,41 @@ impl TypeInfoMetadata {
         TypeInfoMetadata { raw, true_type }
     }
 }
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct TableEntry {
     pub value: Vec<u8>,
     pub meta_data: Option<BTreeMap<String, TypeInfoMetadata>>,
+}
+#[derive(Debug)]
+pub enum DecodingError {
+    IoError(io::Error),
+    MalformedData(String),
+    Empty(),
+}
+impl From<DecodingError> for Box<dyn std::error::Error> {
+    fn from(value: DecodingError) -> Self {
+        match value {
+            DecodingError::IoError(io) => Box::new(io),
+            DecodingError::MalformedData(msg) => {
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+            }
+            DecodingError::Empty() => Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no data to decode",
+            )),
+        }
+    }
+}
+impl From<DecodingError> for MemtableError {
+    fn from(value: DecodingError) -> Self {
+        match value {
+            DecodingError::IoError(err) => MemtableError::WriteAheadLog(WalError::IoErr(err)),
+            DecodingError::Empty() => MemtableError::WriteAheadLog(WalError::EmptyWal()),
+            DecodingError::MalformedData(info) => {
+                MemtableError::WriteAheadLog(WalError::InvalidStructure(info))
+            }
+        }
+    }
 }
 impl TableEntry {
     pub fn new(value: Vec<u8>, meta_data: Option<BTreeMap<String, TypeInfoMetadata>>) -> Self {
@@ -76,13 +121,104 @@ impl TableEntry {
         buffer.write_all(&META_DATA_MAP_DOESNT_EXIST.to_le_bytes())?;
         Ok(buffer)
     }
-    fn deserialize(disk_bytes: Vec<u8>) -> Self {
-        todo!()
+    // takes in a value portion of k-len | k | v-len | v
+    // need to parse out the str-len | str | raw_len | raw | enum pairs into table entry
+    pub fn deserialize(disk_bytes: Vec<u8>) -> Result<Self, DecodingError> {
+        let malformed_error =
+            |msg: &str| -> DecodingError { DecodingError::MalformedData(String::from(msg)) };
+        let buffer_size = disk_bytes.len();
+        const LEN_SIZE: usize = 4;
+        if buffer_size <= LEN_SIZE {
+            return Err(malformed_error(
+                "value buffer does not contain a length prefix for decoding",
+            ));
+        }
+        let mut idx = 0;
+        let val_len =
+            u32::from_le_bytes(disk_bytes[idx..idx + LEN_SIZE].try_into().unwrap()) as usize; // ! replace with ? for error handleing
+        idx += LEN_SIZE;
+        if idx + val_len > buffer_size {
+            return Err(malformed_error(
+                "value buffer does not contain enough bytes for value decoding",
+            ));
+        }
+        let value_bytes = disk_bytes[idx..idx + val_len].to_vec();
+        idx += val_len;
+        // does metaData map exist?
+        if idx + 1 > buffer_size {
+            return Err(malformed_error(
+                "value buffer does not contain meta data flag",
+            ));
+        }
+        let meta_data_exist = &disk_bytes[idx..idx + 1];
+        if meta_data_exist == &[META_DATA_MAP_DOESNT_EXIST] {
+            return Ok(TableEntry {
+                value: value_bytes,
+                meta_data: None,
+            });
+        } else {
+            idx += 1; // move past meta_data_map_exist byte
+            let mut meta_data_hashmap: BTreeMap<String, TypeInfoMetadata> = BTreeMap::new();
+            loop {
+                if idx >= buffer_size {
+                    break;
+                }
+                if idx + LEN_SIZE > buffer_size {
+                    return Err(malformed_error(
+                        "meta data buffer does not contain enough bytes for key-len prefix",
+                    ));
+                }
+                let key_len =
+                    u32::from_le_bytes(disk_bytes[idx..idx + LEN_SIZE].try_into().unwrap())
+                        as usize;
+                idx += LEN_SIZE;
+                if idx + key_len > buffer_size {
+                    return Err(malformed_error(
+                        "meta data buffer does not contain enough bytes to decode key bytes",
+                    ));
+                }
+                let string_val = &disk_bytes[idx..idx + key_len];
+                idx += key_len;
+                if idx + LEN_SIZE > buffer_size {
+                    return Err(malformed_error(
+                        "meta data buffer does not contain enough bytes for byte-len prefix",
+                    ));
+                }
+                let raw_bytes_len =
+                    u32::from_le_bytes(disk_bytes[idx..idx + LEN_SIZE].try_into().unwrap())
+                        as usize;
+                idx += LEN_SIZE;
+                if idx + raw_bytes_len > buffer_size {
+                    return Err(malformed_error(
+                        "meta data buffer does not contain enough bytes to decode raw bytes",
+                    ));
+                }
+                let raw_bytes = &disk_bytes[idx..idx + raw_bytes_len];
+                idx += raw_bytes_len;
+                if idx + 1 > buffer_size {
+                    return Err(malformed_error(
+                        "meta data buffer does not contain enough bytes for true type byte",
+                    ));
+                }
+                let true_type = &disk_bytes[idx..idx + 1];
+                idx += 1;
+                let type_info = TypeInfoMetadata::new(
+                    raw_bytes.to_vec(),
+                    TrueTypes::to_enum_varient(true_type),
+                );
+                let string_repr = String::from_utf8(string_val.to_vec()).unwrap();
+                meta_data_hashmap.insert(string_repr, type_info);
+            }
+            return Ok(TableEntry {
+                value: value_bytes,
+                meta_data: Some(meta_data_hashmap),
+            });
+        }
     }
 }
 #[derive(Debug)]
 pub struct Memtable {
-    wal: WalManager,
+    pub wal: WalManager,
     in_memory_repr: BTreeMap<Vec<u8>, Option<TableEntry>>,
 }
 
@@ -108,7 +244,7 @@ impl TransitiveRepr {
         buffer.write_all(key)?;
         match value {
             WalEntry::Tombstone() => {
-                buffer.write_all(&1u8.to_le_bytes())?;
+                buffer.write_all(&1u32.to_le_bytes())?;
                 buffer.write_all(&TOMB_STONE_BYTE_REPRESENTATION.to_le_bytes())?;
                 return Ok(());
                 // simple write path,     key-len | key | 4 |tombstone marker (0)
@@ -122,9 +258,6 @@ impl TransitiveRepr {
                 // key-len | key | {value-len} | value
             }
         }
-    }
-    fn from_wal_entry<'a>() -> &'a [u8] {
-        &[3u8]
     }
 }
 #[derive(Debug)]
@@ -159,14 +292,15 @@ pub enum WalEntry<'a> {
 }
 impl Memtable {
     pub fn new() -> Result<Self, MemtableError> {
-        let wal_result = WalManager::new(WRITE_AHEAD_LOG_FILE_NAME);
-        if let Err(x) = wal_result {
-            return Err(MemtableError::InitError(x));
-        };
-        Ok(Memtable {
-            wal: wal_result.unwrap(),
+        let mut wal_result = WalManager::new(WRITE_AHEAD_LOG_FILE_NAME)?;
+        let wal_contents = wal_result.drain()?;
+
+        let mut mem = Memtable {
+            wal: wal_result,
             in_memory_repr: BTreeMap::new(),
-        })
+        };
+        mem.rebuild_memtable(wal_contents)?;
+        Ok(mem)
     }
     // mainly just for testing
     fn with_wal_manager(wal_manager: WalManager) -> Self {
@@ -182,6 +316,7 @@ impl Memtable {
         }
         let mut wal_entry_repr = Vec::new();
         TransitiveRepr::new().to_wal_entry(&mut wal_entry_repr, key, WalEntry::Value(&value))?;
+
         self.wal.write_entry(wal_entry_repr.as_slice())?;
         self.in_memory_repr.insert(key.to_vec(), Some(value));
         Result::Ok(())
@@ -204,9 +339,82 @@ impl Memtable {
         Result::Ok(())
     }
     // read from WAL and reconstruct memtable
-    fn consume_wal(&self) -> Result<(), MemtableError> {
+    // ! todo: might needs to place some locking on the file or something?
+    pub fn rebuild_memtable(&mut self, wal_content: Vec<u8>) -> Result<(), MemtableError> {
+        let too_small_parsing_err = |msg: &str| -> Result<(), MemtableError> {
+            Err(MemtableError::WriteAheadLog(WalError::InvalidStructure(
+                String::from(msg),
+            )))
+        };
+        const LEN_SIZE: usize = 4;
+        let max_size = wal_content.len();
+        if max_size == 0 {
+            // ** first time constructing memtable
+            return Ok(());
+        }
+        if max_size < LEN_SIZE {
+            // if no bytes or atleast not enough bytes for the key-len read then return err early
+            return Err(MemtableError::WriteAheadLog(WalError::EmptyWal()));
+        }
+        let mut curr_idx = 0;
+        // at each step where we access the buffer there needs to be bounds checks,
+        // if the bounds check fail then a memtable::Wal::malformed should be returned
+        loop {
+            // wal structure is key-len (u32) | key | value-len (u32) | value
+            //                                            ^
+            if curr_idx >= max_size {
+                break;
+                //return Err(MemtableError::WriteAheadLog(WalError::InvalidStructure()));
+            }
+            let key_len = u32::from_le_bytes(
+                wal_content[curr_idx..curr_idx + LEN_SIZE]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            if key_len == 0 {
+                return too_small_parsing_err("key-length prefix cannot be 0");
+            }
+            curr_idx += LEN_SIZE;
+            if curr_idx + key_len >= max_size {
+                return too_small_parsing_err(
+                    "key-entry contains a length prefix that is larger than the buffer",
+                );
+            }
+            let key_value = wal_content[curr_idx..curr_idx + key_len].to_vec();
+            curr_idx += key_len;
+            if curr_idx + LEN_SIZE >= max_size {
+                return too_small_parsing_err("value-len prefix is not present in the buffer");
+            }
+            let val_len = u32::from_le_bytes(
+                wal_content[curr_idx..curr_idx + LEN_SIZE]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            // to parse the value there are two cases, tombstone and non tombstone, we will grab the value from
+            // value-len like normal but we will compare the returned bytes to the constant TOMB_STONE_BYTE_REPRESENTATION
+            // if they match then we have the entire entry and we can add this into the memtable
+            curr_idx += LEN_SIZE;
+            if curr_idx + val_len > max_size {
+                return too_small_parsing_err(
+                    "value-entry contains a length prefix that is larger than the buffer",
+                );
+            }
+            let raw_value = wal_content[curr_idx..curr_idx + val_len].to_vec();
+            curr_idx += val_len;
+            let table_entry = {
+                if raw_value == [TOMB_STONE_BYTE_REPRESENTATION] {
+                    // this is a tombstone entry so now we can write into mem table with value set to None
+                    (key_value, None)
+                } else {
+                    let x = TableEntry::deserialize(raw_value)?;
+                    (key_value, Some(x))
+                }
+            };
+            self.in_memory_repr.insert(table_entry.0, table_entry.1);
+        }
         Result::Ok(())
     }
+
     // need to read from config to handle this
     // checks if conditions are met to flush
     fn should_flush(&self) -> bool {
@@ -231,6 +439,7 @@ pub struct WalManager {
 #[derive(Debug)]
 pub enum WalError {
     IoErr(std::io::Error),
+    InvalidStructure(String),
     EmptyWal(),
 }
 impl From<std::io::Error> for WalError {
@@ -272,10 +481,16 @@ impl WalManager {
             Err(err) => Err(WalError::IoErr(err)),
         }
     }
+    // ! for now we'll stick to using drain as the main way to consume the WAL and rebuild the
+    // ! memtable, the issue is that this could cause memory strain, as we write all the files contents
+    // ! to a buffer then while this memory buffer exist we iterate across it to build our in memory structs
+    // ! before releasing the memory, so just before the memtable is fully constructed there is (WAL_memory_size * 2) bytes of ram being used
+    // ! this could play a role later when we decided how we want to divy up system resources for different task.
+    // ! also reading/reconstructing the memtable from the WAL should be extremely rare so again for now its fine.
+    // ! possible improvments (read from disk to a medium sized buffer (1-5 MB) and build structs from buffer before refilling from disk, removes the risk of Out Of Memory since at most its the memtable_size + (1-5)MB )
     // consume all the contents of the WAl, this doesnt not delete the current contents of the WAL
     pub fn drain(&mut self) -> Result<Vec<u8>, WalError> {
         let fs_size = self.f.metadata().unwrap().len();
-        println!("(drain) wal is {fs_size} bytes");
         self.f.seek(std::io::SeekFrom::Start(0)).unwrap();
         let mut buf: Vec<u8> = Vec::new();
         let _ = match self.f.read_to_end(&mut buf) {
@@ -327,7 +542,7 @@ mod wal_manager_test {
     #[test]
     fn test_file_name_construct() {
         let name = gen_file_name();
-        println!("{name}")
+        println!("generated file name:\t{name}")
     }
     #[test]
     fn test_init() {
