@@ -9,6 +9,8 @@ tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1.0", features = ["full"] }
 prost-types = "0.13"
+log = "0.4.29"
+simplelog = "0.12"
 
 [build-dependencies]
 tonic-build = "0.12"
