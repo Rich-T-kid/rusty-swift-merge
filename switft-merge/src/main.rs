@@ -14,7 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Uncomment the lines below to start the server instead of just running the test
     let db_instance = Arc::new(Mutex::new(mem::Memtable::new().unwrap()));
 
-    let addr = "[::1]:50051".parse()?;
+    let addr = "0.0.0.0:50051".parse()?;
     service::run_server(db_instance, addr).await?;
 
     Ok(())

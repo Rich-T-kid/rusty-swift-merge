@@ -1,5 +1,5 @@
 use crate::memtable::mem::{Memtable, TableEntry, TrueTypes, TypeInfoMetadata};
-use log::{error, info, warn};
+use log::{info, warn};
 use simplelog::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
