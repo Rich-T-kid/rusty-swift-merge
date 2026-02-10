@@ -623,3 +623,7 @@ mod wal_manager_test {
         manager.remove_file().unwrap();
     }
 }
+
+mod memtable_test {
+    // test internal state of memtable
+}
