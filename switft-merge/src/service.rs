@@ -78,6 +78,14 @@ impl Lsmdb for MyLsmDb {
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<GenericResponse>, Status> {
         info!("Put request: {:?}", request);
         let req = request.into_inner();
+        info!(
+            "Put request: key: {:?} ({})\tvalue:{:?} ({})\tmetadata:{:?}\n",
+            req.key,
+            req.key.len(),
+            req.value,
+            req.value.len(),
+            req.metadata
+        );
 
         // Validate request
         validate_put_request(&req)?;
@@ -121,8 +129,8 @@ impl Lsmdb for MyLsmDb {
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<GenericResponse>, Status> {
-        info!("Delete request: {:?}", request);
         let req = request.into_inner();
+        info!("Delete request: key{:?}\n", req.key);
 
         // lock the database and write a tombstone for the key
         let mut db = self
@@ -137,8 +145,8 @@ impl Lsmdb for MyLsmDb {
 
     // handle get requests to retrieve data
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
-        info!("Get request: {:?}", request);
         let req = request.into_inner();
+        info!("Get request: key: {:?}\tfilter:{:?}\n", req.key, req.filter);
 
         // lock the database for reading
         let db = self
@@ -245,7 +253,7 @@ pub async fn run_server(
         WriteLogger::new(
             LevelFilter::Info,
             Config::default(),
-            File::create("app.log")?,
+            File::options().append(true).create(true).open("app.log")?,
         ),
     ])?;
 
@@ -272,7 +280,7 @@ mod integration_tests {
     use swiftmerge::lsmdb_client::LsmdbClient;
     use swiftmerge::{DeleteRequest, GetRequest, PutRequest};
 
-    const SERVER_ADDRESS: &str = "http://localhost:50051";
+    const SERVER_ADDRESS: &str = "http://104.236.210.9:50051";
 
     #[tokio::test]
     async fn test_grpc_connection() -> Result<(), Box<dyn std::error::Error>> {
