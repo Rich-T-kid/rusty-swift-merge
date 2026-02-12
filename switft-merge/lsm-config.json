@@ -1,0 +1,7 @@
+{
+    "ramMaxSize": 16000,
+    "ramMaxTime": 60,
+    "chunksPerLevel": 8,
+    "compactionRate": 4,
+    "workerThreadRefresh": 2
+}
