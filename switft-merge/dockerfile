@@ -1,0 +1,21 @@
+FROM rust:1.93.0
+WORKDIR /app
+
+# Install protobuf compiler
+RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
+
+# Copy manifests
+COPY ./Cargo.toml ./Cargo.lock ./
+
+# Copy build script and proto files (IMPORTANT!)
+COPY ./build.rs ./build.rs
+COPY ./src/contract.proto ./src/contract.proto
+
+# Copy source
+COPY ./src ./src
+
+# Build the project
+RUN cargo build --release
+
+EXPOSE 50051
+CMD ["./target/release/switft-merge"]

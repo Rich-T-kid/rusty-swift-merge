@@ -261,6 +261,7 @@ impl TransitiveRepr {
     }
 }
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum MemtableError {
     InitError(WalError),
     WriteAheadLog(WalError),
@@ -303,6 +304,7 @@ impl Memtable {
         Ok(mem)
     }
     // mainly just for testing
+    #[allow(dead_code)]
     fn with_wal_manager(wal_manager: WalManager) -> Self {
         Memtable {
             wal: wal_manager,
@@ -432,11 +434,13 @@ impl Iterator for Memtable {
 
 // ! tbd :: type WalManagerResult<T> = std::result::Result<T, WalError>;
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct WalManager {
     f: std::fs::File,
     file_name: String,
 }
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum WalError {
     IoErr(std::io::Error),
     InvalidStructure(String),
@@ -448,6 +452,7 @@ impl From<std::io::Error> for WalError {
     }
 }
 use std::io::{self, ErrorKind, Read, Seek, Write};
+#[allow(dead_code)]
 impl WalManager {
     pub fn new(file_name: &str) -> Result<Self, WalError> {
         let f = match std::fs::File::options()
@@ -490,7 +495,6 @@ impl WalManager {
     // ! possible improvments (read from disk to a medium sized buffer (1-5 MB) and build structs from buffer before refilling from disk, removes the risk of Out Of Memory since at most its the memtable_size + (1-5)MB )
     // consume all the contents of the WAl, this doesnt not delete the current contents of the WAL
     pub fn drain(&mut self) -> Result<Vec<u8>, WalError> {
-        let fs_size = self.f.metadata().unwrap().len();
         self.f.seek(std::io::SeekFrom::Start(0)).unwrap();
         let mut buf: Vec<u8> = Vec::new();
         let _ = match self.f.read_to_end(&mut buf) {
@@ -618,4 +622,8 @@ mod wal_manager_test {
         // ! test clean up
         manager.remove_file().unwrap();
     }
+}
+
+mod memtable_test {
+    // test internal state of memtable
 }

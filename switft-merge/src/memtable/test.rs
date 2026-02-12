@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[allow(unused_imports, dead_code, unused_variables)]
 mod serialize_test {
     mod table_entry_serialize_test {
         use std::{collections::BTreeMap, io::Write};
@@ -171,6 +172,7 @@ mod serialize_test {
     }
 }
 mod deserialize_test {
+    #[allow(unused_imports, dead_code, unused_variables)]
     mod table_entry_deserialize {
         use crate::memtable::mem::{TrueTypes, TypeInfoMetadata};
         use core::panic;
@@ -287,6 +289,8 @@ mod deserialize_test {
             Ok(())
         }
     }
+    #[allow(dead_code)]
+    #[cfg(test)]
     mod transitive_repr_deserialize {
         use std::io::Write;
 
@@ -518,6 +522,8 @@ mod deserialize_test {
             ));
         }
     }
+    #[allow(dead_code)]
+    #[cfg(test)]
     mod multi_key_test {
         use std::io::Write;
 
@@ -778,6 +784,8 @@ mod deserialize_test {
             assert_eq!(*result4, None);
         }
     }
+    #[allow(dead_code)]
+    #[cfg(test)]
     mod memtable_recovery_test {
         use std::collections::BTreeMap;
 

@@ -1,4 +1,5 @@
 # Rust build artifacts
 /target/
-swift-merge/target/**
-swift-merge/target/
+switft-merge/target/**
+switft-merge/target/
+*.log
