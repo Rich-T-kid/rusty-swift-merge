@@ -1,7 +1,10 @@
 {
-    "ramMaxSize": 16000,
+    "ramMaxSize": 1024,
     "ramMaxTime": 60,
-    "chunksPerLevel": 8,
-    "compactionRate": 4,
-    "workerThreadRefresh": 2
+    "targetChunks": 10,
+    "levelSizeMultiplier": 10,
+    "compactionCheckIntervalSeconds": 2,
+    "walEnabled": true,
+    "bloomFalsePositiveRate": 0.01,
+    "maxCompactionThreads": 1
 }

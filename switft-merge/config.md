@@ -1,34 +1,76 @@
 # json doesnt allow comments so this will be my notes
 
+## all keys must exist or else an error will be thrown
+
 ### _ramMaxSize_
 
 1. **this is the maximum size the memtable will grow to before being written to disk**
 2. **the value provided must be the number of bytes**
-3. **(min_value,max_value) -> (16kb,2GB)**
+3. **(min_value,max_value) -> (1KB,2GB)**
 4. should fit in a uint32
 
 ### _ramMaxTime_
 
-1. **represents the max amount of time data will be held in memtable before being flushed to disk. In minutes**
+1. **represents the max amount of time data will be held in memtable before being flushed to disk. In seconds**
 2. **this timer is set by every flush,weather triggered by _ramMaxTime_ or not**
-3. **(min,max) -> (60,10080) [1 hour,7 days]**
+3. **(min,max) -> (10,10080) [10 seconds ,168 hours]**
 4. **should fit in u16**
 
-### _chunksPerLevel_
+### _targetChunks_
 
-1. **represents the number of ss-tables/ memtable chunks that should exist before compaction occures**
-2. **(min_value,max_value) -> (2,255)**
-3. **should fit in u8**
+- thinking about having this implicialy be the levesizemultiplyer, easier to reson about
 
-### _compactionRate_
+1. **represents the target number of SSTables (chunks) each level should aim to maintain**
 
-1. **represents the numbers of previous ss-tables/ memtable chunks that will compacted into a new singler chunk**
-2. **if there arent enough chunks for the new,compacted chunk it reads the remaining chunks and combines those**
-3. **should fit in u8**
-4. **(min,max) -> (2,8)**
+2. **this is not a strict limit, but a structural goal used to determine when compaction should occur**
 
-### _workerThreadRefresh_
+3. **when the number of chunks in a level exceeds this value, compaction is triggered**
+
+4. **level 0 may temporarily contain fewer chunks depending on flush frequency**
+
+5. **(min,max) -> (2,128)**
+
+6. **should fit in u8**
+
+### _levelSizeMultiplier_
+
+1. **represents how much larger each level may grow relative to the previous level**
+
+2. **used to compute the maximum total size allowed per level**
+
+3. **level_n_max_size = level_0_max_size × (levelSizeMultiplier ^ n)**
+
+4. **higher values reduce the number of levels but increase compaction cost per level**
+
+5. **lower values increase number of levels but reduce per-level compaction pressure**
+
+6. **(min,max) -> (2,20)**
+
+7. **should fit in u8**
+
+- note -> level_0_max_size = ramMaxSize × targetChunks
+
+### _compactionCheckIntervalSeconds_
 
 1. **represents in minutes the time inbetween when a background thread checks for _chunksPerLevel_ and _compactionRate_ and updates the lsm-tree accordingly**
 2. **(min,max) -> (1,240) [one minute,4 hours]**
 3. **should fit in u8**
+
+### _walEnabled_
+
+1. **if set to true all writes will first be written to Write Ahead Logs. this ensures in case of crash data can be recovered**
+2. **bool**
+
+### _bloomFalsePositiveRate_
+
+1. **represents the acceptable false positive rate for bloom filters used in ss-tables**
+2. **lower values reduce false positives but increase memory usage**
+3. **(min,max) -> (0.001,0.1) [0.1% to 10%]**
+4. **should be a float64**
+
+### _maxCompactionThreads_
+
+1. **represents the maximum number of threads that can be used for compaction operations**
+2. **higher values speed up compaction but use more system resources**
+3. **(min,max) -> (1,system_thread_max)**
+4. **should fit in u8**
