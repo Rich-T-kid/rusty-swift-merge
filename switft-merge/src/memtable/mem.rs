@@ -223,6 +223,7 @@ pub struct Memtable {
     pub wal: WalManager,
     in_memory_repr: BTreeMap<Vec<u8>, Option<TableEntry>>,
     config: Option<ConfigInfo>,
+    metrics: MetricTracker,
 }
 
 pub struct TransitiveRepr {}
@@ -339,6 +340,7 @@ impl Memtable {
             wal: wal_result,
             in_memory_repr: BTreeMap::new(),
             config: None,
+            metrics: MetricTracker::new(),
         };
         mem.rebuild_memtable(wal_contents)?;
         Ok(mem)
@@ -350,13 +352,16 @@ impl Memtable {
             wal: wal_manager,
             in_memory_repr: BTreeMap::new(),
             config: None,
+            metrics: MetricTracker::new(),
         }
     }
 
     pub fn put(&mut self, key: &[u8], value: TableEntry) -> Result<(), MemtableError> {
         if self.should_flush() {
-            self.flush()?
+            self.flush()?;
+            self.metrics.flush_counter += 1;
         }
+        self.metrics.memtable_writes += 1;
         let mut wal_entry_repr = Vec::new();
         TransitiveRepr::new().to_wal_entry(&mut wal_entry_repr, key, WalEntry::Value(&value))?;
 
@@ -365,20 +370,47 @@ impl Memtable {
         Result::Ok(())
     }
     pub fn delete(&mut self, key: &[u8]) -> Result<(), MemtableError> {
+        if self.should_flush() {
+            self.flush()?;
+            self.metrics.flush_counter += 1;
+        }
+        self.metrics.memtable_writes += 1;
         let mut wal_entry_repr = Vec::new();
         TransitiveRepr::new().to_wal_entry(&mut wal_entry_repr, key, WalEntry::Tombstone())?;
         self.wal.write_entry(wal_entry_repr.as_slice())?;
         self.in_memory_repr.insert(key.to_vec(), None);
         Result::Ok(())
     }
-    pub fn get(&self, key: &[u8]) -> Result<&Option<TableEntry>, lsm::LsmTreeError> {
+    pub fn get(&mut self, key: &[u8]) -> Result<&Option<TableEntry>, lsm::LsmTreeError> {
+        self.metrics.memtable_reads += 1;
         match self.in_memory_repr.get(key) {
-            None => return Err(lsm::LsmTreeError::Unimplemented()), // ! if it doesnt exist in memory, read from disk (tbd)
+            None => {
+                return {
+                    self.metrics.lsm_reads += 1;
+                    // lsm-reader should return
+                    // # of ss-tables it read
+                    // # of lsm-tree levels it traversed
+                    // self.metrics.ss_table_reads += lsm_reader()
+                    // just log out how many ss_tables this request took, caller doesnt care
+                    Err(lsm::LsmTreeError::Unimplemented())
+                };
+            } // ! if it doesnt exist in memory, read from disk (tbd)
             Some(value) => Ok(value),
         }
     }
     // write in memory contents out to lsm tree as Level 0
     fn flush(&mut self) -> Result<(), lsm::LsmTreeError> {
+        let start = time::Instant::now();
+
+        /*
+
+
+
+        */
+
+        self.metrics
+            .flush_duration
+            .push(time::Instant::now() - start);
         Result::Ok(())
     }
     // read from WAL and reconstruct memtable
@@ -545,6 +577,25 @@ impl ConfigInfo {
         Ok(())
     }
 }
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct MetricTracker {
+    memtable_reads: u64,
+    lsm_reads: u64,
+    ss_table_reads: u64, //(for global data, will also be a local one for GET request)
+    // writes
+    memtable_writes: u64,
+    flush_counter: u64,
+    // auxiliry
+    flush_duration: Vec<time::Duration>,
+    total_ss_tables_merged: u64,
+    merge_output_size: Vec<u64>,
+}
+impl MetricTracker {
+    fn new() -> Self {
+        Self::default()
+    }
+}
 // This will be useful when we are flushing to disk
 // output elements in sorted order <low key -> high key)
 impl Iterator for Memtable {
@@ -572,8 +623,8 @@ impl From<std::io::Error> for WalError {
         WalError::IoErr(e)
     }
 }
-use std::fs;
 use std::io::{self, ErrorKind, Read, Seek, Write};
+use std::{fs, time};
 #[allow(dead_code)]
 impl WalManager {
     pub fn new(file_name: &str) -> Result<Self, WalError> {

@@ -149,7 +149,7 @@ impl Lsmdb for MyLsmDb {
         info!("Get request: key: {:?}\tfilter:{:?}\n", req.key, req.filter);
 
         // lock the database for reading
-        let db = self
+        let mut db = self
             .db
             .lock()
             .map_err(|_| Status::internal("lock poisoned"))?;
