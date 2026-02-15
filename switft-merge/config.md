@@ -1,6 +1,4 @@
-# json doesnt allow comments so this will be my notes
-
-## all keys must exist or else an error will be thrown
+# all keys must exist or else an error will be thrown
 
 ### _ramMaxSize_
 
@@ -18,7 +16,7 @@
 
 ### _targetChunks_
 
-- thinking about having this implicialy be the levesizemultiplyer, easier to reson about
+- level_n_max_size = ramMaxSize × (targetChunks ^ (n+1))
 
 1. **represents the target number of SSTables (chunks) each level should aim to maintain**
 
@@ -32,29 +30,11 @@
 
 6. **should fit in u8**
 
-### _levelSizeMultiplier_
-
-1. **represents how much larger each level may grow relative to the previous level**
-
-2. **used to compute the maximum total size allowed per level**
-
-3. **level_n_max_size = level_0_max_size × (levelSizeMultiplier ^ n)**
-
-4. **higher values reduce the number of levels but increase compaction cost per level**
-
-5. **lower values increase number of levels but reduce per-level compaction pressure**
-
-6. **(min,max) -> (2,20)**
-
-7. **should fit in u8**
-
-- note -> level_0_max_size = ramMaxSize × targetChunks
-
 ### _compactionCheckIntervalSeconds_
 
 1. **represents in seconds the time inbetween when a background thread checks for _chunksPerLevel_ and _compactionRate_ and updates the lsm-tree accordingly**
 2. **(min,max) -> (1,14400) [one second,4 hours]**
-3. **should fit in u8**
+3. **should fit in u16**
 
 ### _walEnabled_
 

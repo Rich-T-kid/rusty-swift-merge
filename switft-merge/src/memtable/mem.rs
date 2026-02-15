@@ -467,16 +467,18 @@ impl Memtable {
     pub fn update_config(&mut self, content: ConfigSource) -> Result<(), MemtableError> {
         match content {
             ConfigSource::FileSource(name) => {
-                let config_as_str = fs::read_to_string(name)?;
+                let config_as_str = fs::read_to_string(name)
+                    .map_err(|_| MemtableError::InitError(MemInitError::MissingConfig()))?;
                 if config_as_str.len() == 0 {
                     return Err(MemtableError::InitError(MemInitError::MissingConfig()));
                 }
-                println!("raw:\t{}", config_as_str);
                 let mut config: ConfigInfo = serde_json::from_str(&config_as_str)?;
                 config.validate()?;
                 self.config = Some(config);
             }
-            _ => {}
+            _ => {
+                todo!()
+            }
         }
         Ok(())
     }
@@ -487,8 +489,7 @@ struct ConfigInfo {
     ram_max_size: u32,
     ram_max_time: u16,
     target_chunks: u8,
-    level_size_multiplier: u8,
-    compaction_check_interval_seconds: u8,
+    compaction_check_interval_seconds: u16,
     wal_enabled: bool,
     bloom_false_positive_rate: f64,
     max_compaction_threads: u8,
@@ -516,13 +517,10 @@ impl ConfigInfo {
             )));
         }
 
-        if self.level_size_multiplier < 2 || self.level_size_multiplier > 20 {
-            return Err(MemInitError::InvalidArgument(format!(
-                "key:(level_size_multiplier) has value outside valid range (2,20)"
-            )));
-        }
-
-        if self.compaction_check_interval_seconds < 1 {
+        if self.compaction_check_interval_seconds < 1
+            || self.compaction_check_interval_seconds > (60 * 60) * 4
+        {
+            // [1 second ,4 hours]
             return Err(MemInitError::InvalidArgument(format!(
                 "key:(compaction_check_interval_seconds) has value outside valid range (1,14400) [1 second, 4 hours]"
             )));
@@ -539,7 +537,7 @@ impl ConfigInfo {
                 "key:(max_compaction_threads) has value outside valid range (1,system_thread_max)"
             )));
         }
-        self.max_compaction_threads = std::cmp::max(
+        self.max_compaction_threads = std::cmp::min(
             self.max_compaction_threads,
             available_parallelism().unwrap().get() as u8,
         );
@@ -556,7 +554,6 @@ impl Iterator for Memtable {
     }
 }
 
-// ! tbd :: type WalManagerResult<T> = std::result::Result<T, WalError>;
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct WalManager {
@@ -575,10 +572,8 @@ impl From<std::io::Error> for WalError {
         WalError::IoErr(e)
     }
 }
-use std::fmt::format;
 use std::fs;
 use std::io::{self, ErrorKind, Read, Seek, Write};
-use std::u8::MAX;
 #[allow(dead_code)]
 impl WalManager {
     pub fn new(file_name: &str) -> Result<Self, WalError> {
@@ -761,7 +756,6 @@ mod config_test {
             "ramMaxSize": 1048576,
             "ramMaxTime": 60,
             "targetChunks": 10,
-            "levelSizeMultiplier": 10,
             "compactionCheckIntervalSeconds": 2,
             "walEnabled": true,
             "bloomFalsePositiveRate": 0.01,
@@ -778,7 +772,6 @@ mod config_test {
             "ramMaxSize": 512,
             "ramMaxTime": 60,
             "targetChunks": 10,
-            "levelSizeMultiplier": 10,
             "compactionCheckIntervalSeconds": 2,
             "walEnabled": true,
             "bloomFalsePositiveRate": 0.01,
@@ -802,7 +795,6 @@ mod config_test {
             "ramMaxSize": 1048576,
             "ramMaxTime": 60,
             "targetChunks": 10,
-            "levelSizeMultiplier": 10,
             "compactionCheckIntervalSeconds": 2,
             "walEnabled": true,
             "bloomFalsePositiveRate": 0.15,
@@ -826,7 +818,6 @@ mod config_test {
             "ramMaxSize": 1048576,
             "ramMaxTime": 60,
             "targetChunks": 1,
-            "levelSizeMultiplier": 10,
             "compactionCheckIntervalSeconds": 2,
             "walEnabled": true,
             "bloomFalsePositiveRate": 0.01,
@@ -850,7 +841,6 @@ mod config_test {
             "ramMaxSize": 1048576,
             "ramMaxTime": 5,
             "targetChunks": 10,
-            "levelSizeMultiplier": 10,
             "compactionCheckIntervalSeconds": 2,
             "walEnabled": true,
             "bloomFalsePositiveRate": 0.01,
