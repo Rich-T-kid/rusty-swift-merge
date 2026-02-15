@@ -52,8 +52,8 @@
 
 ### _compactionCheckIntervalSeconds_
 
-1. **represents in minutes the time inbetween when a background thread checks for _chunksPerLevel_ and _compactionRate_ and updates the lsm-tree accordingly**
-2. **(min,max) -> (1,240) [one minute,4 hours]**
+1. **represents in seconds the time inbetween when a background thread checks for _chunksPerLevel_ and _compactionRate_ and updates the lsm-tree accordingly**
+2. **(min,max) -> (1,14400) [one second,4 hours]**
 3. **should fit in u8**
 
 ### _walEnabled_

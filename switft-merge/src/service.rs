@@ -236,13 +236,7 @@ impl Lsmdb for MyLsmDb {
         ))
     }
 }
-
-// helper function to start the grpc server
-pub async fn run_server(
-    db: Arc<Mutex<Memtable>>,
-    addr: std::net::SocketAddr,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let lsm_db = MyLsmDb::new(db);
+pub fn init_logger() -> Result<(), Box<dyn std::error::Error>> {
     CombinedLogger::init(vec![
         TermLogger::new(
             LevelFilter::Debug,
@@ -256,6 +250,14 @@ pub async fn run_server(
             File::options().append(true).create(true).open("app.log")?,
         ),
     ])?;
+    Ok(())
+}
+// helper function to start the grpc server
+pub async fn run_server(
+    db: Arc<Mutex<Memtable>>,
+    addr: std::net::SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let lsm_db = MyLsmDb::new(db);
 
     info!("lsm-db grpc server listening on {}", addr);
 
