@@ -1,5 +1,7 @@
 use super::lsm;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::thread::available_parallelism;
 pub const WRITE_AHEAD_LOG_FILE_NAME: &str = "Wal.tmp";
 pub const TOMB_STONE_BYTE_REPRESENTATION: u8 = 255;
 pub const META_DATA_MAP_DOESNT_EXIST: u8 = 0u8;
@@ -122,7 +124,7 @@ impl TableEntry {
         Ok(buffer)
     }
     // takes in a value portion of k-len | k | v-len | v
-    // need to parse out the str-len | str | raw_len | raw | enum pairs into table entry
+    // need to parse out the str-len | str | raw-len | raw | enum pairs into table entry
     pub fn deserialize(disk_bytes: Vec<u8>) -> Result<Self, DecodingError> {
         let malformed_error =
             |msg: &str| -> DecodingError { DecodingError::MalformedData(String::from(msg)) };
@@ -220,6 +222,7 @@ impl TableEntry {
 pub struct Memtable {
     pub wal: WalManager,
     in_memory_repr: BTreeMap<Vec<u8>, Option<TableEntry>>,
+    config: Option<ConfigInfo>,
 }
 
 pub struct TransitiveRepr {}
@@ -263,7 +266,7 @@ impl TransitiveRepr {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum MemtableError {
-    InitError(WalError),
+    InitError(MemInitError),
     WriteAheadLog(WalError),
     LsmTreeError(lsm::LsmTreeError),
 }
@@ -282,14 +285,50 @@ impl From<lsm::LsmTreeError> for MemtableError {
         Self::LsmTreeError(value)
     }
 }
-/*#[derive(Debug)]
-pub enum LsmTreeError {
-    Unimplemented(),
-    ErrorFlushing(),
-}*/
+impl From<serde_json::Error> for MemtableError {
+    fn from(value: serde_json::Error) -> Self {
+        let err_msg = value.to_string();
+
+        // Check if it's a missing field error
+        if err_msg.contains("missing field") {
+            // Extract field name from error message (between backticks)
+            if let Some(start) = err_msg.find("`") {
+                if let Some(end) = err_msg[start + 1..].find("`") {
+                    let field_name = &err_msg[start + 1..start + 1 + end];
+                    return MemtableError::InitError(MemInitError::MissingKey(
+                        field_name.to_string(),
+                    ));
+                }
+            }
+        }
+
+        MemtableError::InitError(MemInitError::InvalidFormat(format!(
+            "failed to parse json file: {:?} ",
+            value,
+        )))
+    }
+}
+impl From<MemInitError> for MemtableError {
+    fn from(value: MemInitError) -> Self {
+        MemtableError::InitError(value)
+    }
+}
+
+#[derive(Debug)]
+pub enum MemInitError {
+    MissingKey(String),
+    InvalidArgument(String),
+    MissingConfig(),
+    InvalidFormat(String),
+}
+
 pub enum WalEntry<'a> {
     Value(&'a TableEntry),
     Tombstone(),
+}
+pub enum ConfigSource<'a> {
+    FileSource(&'a String),
+    RawBytes(Vec<u8>),
 }
 impl Memtable {
     pub fn new() -> Result<Self, MemtableError> {
@@ -299,6 +338,7 @@ impl Memtable {
         let mut mem = Memtable {
             wal: wal_result,
             in_memory_repr: BTreeMap::new(),
+            config: None,
         };
         mem.rebuild_memtable(wal_contents)?;
         Ok(mem)
@@ -309,6 +349,7 @@ impl Memtable {
         Memtable {
             wal: wal_manager,
             in_memory_repr: BTreeMap::new(),
+            config: None,
         }
     }
 
@@ -422,6 +463,87 @@ impl Memtable {
     fn should_flush(&self) -> bool {
         false
     }
+    // should be able to handle a file or a load of bytes (grpc call)
+    pub fn update_config(&mut self, content: ConfigSource) -> Result<(), MemtableError> {
+        match content {
+            ConfigSource::FileSource(name) => {
+                let config_as_str = fs::read_to_string(name)
+                    .map_err(|_| MemtableError::InitError(MemInitError::MissingConfig()))?;
+                if config_as_str.len() == 0 {
+                    return Err(MemtableError::InitError(MemInitError::MissingConfig()));
+                }
+                let mut config: ConfigInfo = serde_json::from_str(&config_as_str)?;
+                config.validate()?;
+                self.config = Some(config);
+            }
+            _ => {
+                todo!()
+            }
+        }
+        Ok(())
+    }
+}
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ConfigInfo {
+    ram_max_size: u32,
+    ram_max_time: u16,
+    target_chunks: u8,
+    compaction_check_interval_seconds: u16,
+    wal_enabled: bool,
+    bloom_false_positive_rate: f64,
+    max_compaction_threads: u8,
+}
+impl ConfigInfo {
+    const KILOBYTE: u32 = 1024;
+    const MEGABYTE: u32 = Self::KILOBYTE * Self::KILOBYTE;
+    fn validate(&mut self) -> Result<(), MemInitError> {
+        // go through each field, follow config.md guidelines
+        if self.ram_max_size < Self::KILOBYTE || self.ram_max_size > Self::MEGABYTE * 2048 {
+            return Err(MemInitError::InvalidArgument(format!(
+                "key:(ram_max_size) has value outside valid range (1KB,2GB)"
+            )));
+        }
+
+        if self.ram_max_time < 10 || self.ram_max_time > 10080 {
+            return Err(MemInitError::InvalidArgument(format!(
+                "key:(ram_max_time) has value outside valid range (10,10080) [10 seconds, 168 hours]"
+            )));
+        }
+
+        if self.target_chunks < 2 || self.target_chunks > 128 {
+            return Err(MemInitError::InvalidArgument(format!(
+                "key:(target_chunks) has value outside valid range (2,128)"
+            )));
+        }
+
+        if self.compaction_check_interval_seconds < 1
+            || self.compaction_check_interval_seconds > (60 * 60) * 4
+        {
+            // [1 second ,4 hours]
+            return Err(MemInitError::InvalidArgument(format!(
+                "key:(compaction_check_interval_seconds) has value outside valid range (1,14400) [1 second, 4 hours]"
+            )));
+        }
+
+        if self.bloom_false_positive_rate < 0.001 || self.bloom_false_positive_rate > 0.1 {
+            return Err(MemInitError::InvalidArgument(format!(
+                "key:(bloom_false_positive_rate) has value outside valid range (0.001,0.1) [0.1% to 10%]"
+            )));
+        }
+
+        if self.max_compaction_threads < 1 {
+            return Err(MemInitError::InvalidArgument(format!(
+                "key:(max_compaction_threads) has value outside valid range (1,system_thread_max)"
+            )));
+        }
+        self.max_compaction_threads = std::cmp::min(
+            self.max_compaction_threads,
+            available_parallelism().unwrap().get() as u8,
+        );
+
+        Ok(())
+    }
 }
 // This will be useful when we are flushing to disk
 // output elements in sorted order <low key -> high key)
@@ -432,7 +554,6 @@ impl Iterator for Memtable {
     }
 }
 
-// ! tbd :: type WalManagerResult<T> = std::result::Result<T, WalError>;
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct WalManager {
@@ -451,6 +572,7 @@ impl From<std::io::Error> for WalError {
         WalError::IoErr(e)
     }
 }
+use std::fs;
 use std::io::{self, ErrorKind, Read, Seek, Write};
 #[allow(dead_code)]
 impl WalManager {
@@ -624,6 +746,115 @@ mod wal_manager_test {
     }
 }
 
-mod memtable_test {
-    // test internal state of memtable
+mod config_test {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_valid_config() {
+        let config_json = json!({
+            "ramMaxSize": 1048576,
+            "ramMaxTime": 60,
+            "targetChunks": 10,
+            "compactionCheckIntervalSeconds": 2,
+            "walEnabled": true,
+            "bloomFalsePositiveRate": 0.01,
+            "maxCompactionThreads": 4
+        });
+
+        let mut config: ConfigInfo = serde_json::from_value(config_json).unwrap();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_ram_max_size_too_small() {
+        let config_json = json!({
+            "ramMaxSize": 512,
+            "ramMaxTime": 60,
+            "targetChunks": 10,
+            "compactionCheckIntervalSeconds": 2,
+            "walEnabled": true,
+            "bloomFalsePositiveRate": 0.01,
+            "maxCompactionThreads": 4
+        });
+
+        let mut config: ConfigInfo = serde_json::from_value(config_json).unwrap();
+        let result = config.validate();
+        assert!(result.is_err());
+        match result {
+            Err(MemInitError::InvalidArgument(msg)) => {
+                assert!(msg.contains("ram_max_size"));
+            }
+            _ => panic!("Expected InvalidArgument error for ram_max_size"),
+        }
+    }
+
+    #[test]
+    fn test_bloom_false_positive_rate_out_of_bounds() {
+        let config_json = json!({
+            "ramMaxSize": 1048576,
+            "ramMaxTime": 60,
+            "targetChunks": 10,
+            "compactionCheckIntervalSeconds": 2,
+            "walEnabled": true,
+            "bloomFalsePositiveRate": 0.15,
+            "maxCompactionThreads": 4
+        });
+
+        let mut config: ConfigInfo = serde_json::from_value(config_json).unwrap();
+        let result = config.validate();
+        assert!(result.is_err());
+        match result {
+            Err(MemInitError::InvalidArgument(msg)) => {
+                assert!(msg.contains("bloom_false_positive_rate"));
+            }
+            _ => panic!("Expected InvalidArgument error for bloom_false_positive_rate"),
+        }
+    }
+
+    #[test]
+    fn test_target_chunks_too_low() {
+        let config_json = json!({
+            "ramMaxSize": 1048576,
+            "ramMaxTime": 60,
+            "targetChunks": 1,
+            "compactionCheckIntervalSeconds": 2,
+            "walEnabled": true,
+            "bloomFalsePositiveRate": 0.01,
+            "maxCompactionThreads": 4
+        });
+
+        let mut config: ConfigInfo = serde_json::from_value(config_json).unwrap();
+        let result = config.validate();
+        assert!(result.is_err());
+        match result {
+            Err(MemInitError::InvalidArgument(msg)) => {
+                assert!(msg.contains("target_chunks"));
+            }
+            _ => panic!("Expected InvalidArgument error for target_chunks"),
+        }
+    }
+
+    #[test]
+    fn test_ram_max_time_out_of_bounds() {
+        let config_json = json!({
+            "ramMaxSize": 1048576,
+            "ramMaxTime": 5,
+            "targetChunks": 10,
+            "compactionCheckIntervalSeconds": 2,
+            "walEnabled": true,
+            "bloomFalsePositiveRate": 0.01,
+            "maxCompactionThreads": 4
+        });
+
+        let mut config: ConfigInfo = serde_json::from_value(config_json).unwrap();
+        let result = config.validate();
+        assert!(result.is_err());
+        match result {
+            Err(MemInitError::InvalidArgument(msg)) => {
+                assert!(msg.contains("ram_max_time"));
+            }
+            _ => panic!("Expected InvalidArgument error for ram_max_time"),
+        }
+    }
 }
