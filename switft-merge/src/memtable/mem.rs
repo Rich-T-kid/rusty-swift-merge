@@ -3,7 +3,12 @@ use crate::lsm_tree::disk;
 use super::lsm;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::{self, ErrorKind, Read, Seek, Write};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::thread::available_parallelism;
+use std::{fs, time};
+
 pub const WRITE_AHEAD_LOG_FILE_NAME: &str = "Wal.tmp";
 pub const TOMB_STONE_BYTE_REPRESENTATION: u8 = 255;
 pub const META_DATA_MAP_DOESNT_EXIST: u8 = 0u8;
@@ -271,6 +276,7 @@ impl TransitiveRepr {
 #[allow(dead_code)]
 pub enum MemtableError {
     InitError(MemInitError),
+    Invariant(String),
     WriteAheadLog(WalError),
     LsmTreeError(lsm::LsmTreeError),
 }
@@ -334,12 +340,24 @@ pub enum ConfigSource<'a> {
     FileSource(&'a String),
     RawBytes(Vec<u8>),
 }
-use std::sync::{Arc, Mutex};
-use std::thread;
+
+// Helper function to handle poisoned mutex
+fn lock_or_error<'a, T>(
+    mutex: &'a Mutex<T>,
+) -> Result<std::sync::MutexGuard<'a, T>, MemtableError> {
+    mutex
+        .lock()
+        .map_err(|e| MemtableError::Invariant(format!("Mutex poisoned: {:?}", e)))
+}
+
 fn periodic_metric_flush(metrics: Vec<Arc<Mutex<dyn MetricTracker>>>) {
     loop {
         for m in &metrics {
-            match m.lock().unwrap().flush() {
+            let result = m
+                .lock()
+                .map_err(|e| MemtableError::Invariant(format!("Mutex poisoned: {:?}", e)))
+                .and_then(|guard| guard.flush());
+            match result {
                 Ok(_) => {
                     println!(
                         "wrote metrics to file just fine! {:?}",
@@ -376,7 +394,6 @@ impl Memtable {
                 memory_tracker_clone as Arc<Mutex<dyn MetricTracker>>,
                 disk_tracker_clone as Arc<Mutex<dyn MetricTracker>>,
             ]);
-            println!("exited multi_thread_fn")
         });
 
         Ok(mem)
@@ -396,9 +413,9 @@ impl Memtable {
     pub fn put(&mut self, key: &[u8], value: TableEntry) -> Result<(), MemtableError> {
         if self.should_flush() {
             self.flush()?;
-            self.memory_metrics.lock().unwrap().flush_counter += 1;
+            lock_or_error(&self.memory_metrics)?.flush_counter += 1;
         }
-        self.memory_metrics.lock().unwrap().memtable_writes += 1;
+        lock_or_error(&self.memory_metrics)?.memtable_writes += 1;
         let mut wal_entry_repr = Vec::new();
         TransitiveRepr::new().to_wal_entry(&mut wal_entry_repr, key, WalEntry::Value(&value))?;
 
@@ -409,34 +426,36 @@ impl Memtable {
     pub fn delete(&mut self, key: &[u8]) -> Result<(), MemtableError> {
         if self.should_flush() {
             self.flush()?;
-            self.memory_metrics.lock().unwrap().flush_counter += 1;
+            lock_or_error(&self.memory_metrics)?.flush_counter += 1;
         }
-        self.memory_metrics.lock().unwrap().memtable_writes += 1;
+        lock_or_error(&self.memory_metrics)?.memtable_writes += 1;
         let mut wal_entry_repr = Vec::new();
         TransitiveRepr::new().to_wal_entry(&mut wal_entry_repr, key, WalEntry::Tombstone())?;
         self.wal.write_entry(wal_entry_repr.as_slice())?;
         self.in_memory_repr.insert(key.to_vec(), None);
         Result::Ok(())
     }
-    pub fn get(&mut self, key: &[u8]) -> Result<&Option<TableEntry>, lsm::LsmTreeError> {
-        self.memory_metrics.lock().unwrap().memtable_reads += 1;
+    pub fn get(&self, key: &[u8]) -> Result<&Option<TableEntry>, MemtableError> {
+        lock_or_error(&self.memory_metrics)?.memtable_reads += 1;
         match self.in_memory_repr.get(key) {
             None => {
                 return {
-                    self.memory_metrics.lock().unwrap().lsm_reads += 1;
+                    lock_or_error(&self.memory_metrics)?.lsm_reads += 1;
                     // lsm-reader should return
                     // # of ss-tables it read
                     // # of lsm-tree levels it traversed
                     // self.metrics.ss_table_reads += lsm_reader()
                     // just log out how many ss_tables this request took, caller doesnt care
-                    Err(lsm::LsmTreeError::Unimplemented())
+                    Err(MemtableError::LsmTreeError(
+                        lsm::LsmTreeError::Unimplemented(),
+                    ))
                 };
             } // ! if it doesnt exist in memory, read from disk (tbd)
             Some(value) => Ok(value),
         }
     }
     // write in memory contents out to lsm tree as Level 0
-    fn flush(&mut self) -> Result<(), lsm::LsmTreeError> {
+    fn flush(&mut self) -> Result<(), MemtableError> {
         let start = time::Instant::now();
 
         /*
@@ -445,9 +464,7 @@ impl Memtable {
 
         */
 
-        self.memory_metrics
-            .lock()
-            .unwrap()
+        lock_or_error(&self.memory_metrics)?
             .flush_duration
             .push(start.elapsed());
         Result::Ok(())
@@ -616,7 +633,7 @@ impl ConfigInfo {
         Ok(())
     }
 }
-trait MetricTracker {
+trait MetricTracker: Send + Sync {
     fn flush(&self) -> Result<(), MemtableError>;
 }
 
@@ -766,8 +783,7 @@ impl From<std::io::Error> for WalError {
         WalError::IoErr(e)
     }
 }
-use std::io::{self, ErrorKind, Read, Seek, Write};
-use std::{fs, time};
+
 #[allow(dead_code)]
 impl WalManager {
     pub fn new(file_name: &str) -> Result<Self, WalError> {

@@ -947,6 +947,6 @@ mod metric_test {
         assert_eq!(tracker2.merge_output_size, vec![1024, 2048, 4096]);
 
         // Clean up test file
-        let _ = std::fs::remove_file(test_filepath);
+        std::fs::remove_file(test_filepath).ok();
     }
 }
