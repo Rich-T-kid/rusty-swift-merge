@@ -861,7 +861,7 @@ mod deserialize_test {
             drop(mg);
 
             // Create a new memtable and verify all keys still exist
-            let mg2 = Memtable::new().unwrap();
+            let mut mg2 = Memtable::new().unwrap();
 
             let keys = vec![
                 "user:1001",
@@ -879,5 +879,74 @@ mod deserialize_test {
                 assert!(result.is_some(), "Key {} should exist after recovery", key);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod metric_test {
+    use crate::memtable::mem::{DiskTreeMetricTracker, MemMetricTracker};
+
+    #[test]
+    fn test_mem_metric_tracker_new_and_flush() {
+        let test_filepath = "test_metrics/memory_metrics_test.json";
+
+        // Create a new tracker with custom filepath
+        let mut tracker = MemMetricTracker::new_with_file_path(test_filepath)
+            .expect("Failed to create MemMetricTracker");
+
+        // Increment some fields to test persistence
+        tracker.memtable_reads = 42;
+        tracker.memtable_writes = 100;
+        tracker.flush_counter = 5;
+        tracker.lsm_reads = 10;
+        tracker.ss_table_reads = 25;
+
+        // Flush the metrics to disk
+        tracker
+            .flush_metrics_with_fp(test_filepath)
+            .expect("Failed to flush metrics");
+
+        // Read it back to verify it was written
+        let tracker2 = MemMetricTracker::new_with_file_path(test_filepath)
+            .expect("Failed to read metrics from disk");
+
+        // Verify the values were persisted
+        assert_eq!(tracker2.memtable_reads, 42);
+        assert_eq!(tracker2.memtable_writes, 100);
+        assert_eq!(tracker2.flush_counter, 5);
+        assert_eq!(tracker2.lsm_reads, 10);
+        assert_eq!(tracker2.ss_table_reads, 25);
+
+        // Clean up test file
+        let _ = std::fs::remove_file(test_filepath);
+    }
+
+    #[test]
+    fn test_disk_metric_tracker_new_and_flush() {
+        let test_filepath = "test_metrics/disk_metrics_test.json";
+
+        // Create a new tracker with custom filepath
+        let mut tracker = DiskTreeMetricTracker::new_with_file_path(test_filepath)
+            .expect("Failed to create DiskTreeMetricTracker");
+
+        // Increment some fields to test persistence
+        tracker.total_ss_tables_merged = 15;
+        tracker.merge_output_size = vec![1024, 2048, 4096];
+
+        // Flush the metrics to disk
+        tracker
+            .flush_metrics_with_fp(test_filepath)
+            .expect("Failed to flush metrics");
+
+        // Read it back to verify it was written
+        let tracker2 = DiskTreeMetricTracker::new_with_file_path(test_filepath)
+            .expect("Failed to read metrics from disk");
+
+        // Verify the values were persisted
+        assert_eq!(tracker2.total_ss_tables_merged, 15);
+        assert_eq!(tracker2.merge_output_size, vec![1024, 2048, 4096]);
+
+        // Clean up test file
+        let _ = std::fs::remove_file(test_filepath);
     }
 }

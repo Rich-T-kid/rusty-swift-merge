@@ -1,6 +1,6 @@
+mod lsm_tree;
 mod memtable;
 mod service;
-
 use crate::{memtable::mem, service::init_logger};
 use std::{
     env,
