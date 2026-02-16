@@ -1,7 +1,14 @@
+use crate::lsm_tree::disk;
+
 use super::lsm;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::{self, ErrorKind, Read, Seek, Write};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::thread::available_parallelism;
+use std::{fs, time};
+
 pub const WRITE_AHEAD_LOG_FILE_NAME: &str = "Wal.tmp";
 pub const TOMB_STONE_BYTE_REPRESENTATION: u8 = 255;
 pub const META_DATA_MAP_DOESNT_EXIST: u8 = 0u8;
@@ -223,6 +230,8 @@ pub struct Memtable {
     pub wal: WalManager,
     in_memory_repr: BTreeMap<Vec<u8>, Option<TableEntry>>,
     config: Option<ConfigInfo>,
+    memory_metrics: Arc<Mutex<MemMetricTracker>>,
+    disk_metrics: Arc<Mutex<DiskTreeMetricTracker>>,
 }
 
 pub struct TransitiveRepr {}
@@ -267,6 +276,7 @@ impl TransitiveRepr {
 #[allow(dead_code)]
 pub enum MemtableError {
     InitError(MemInitError),
+    Invariant(String),
     WriteAheadLog(WalError),
     LsmTreeError(lsm::LsmTreeError),
 }
@@ -330,17 +340,62 @@ pub enum ConfigSource<'a> {
     FileSource(&'a String),
     RawBytes(Vec<u8>),
 }
+
+// Helper function to handle poisoned mutex
+fn lock_or_error<'a, T>(
+    mutex: &'a Mutex<T>,
+) -> Result<std::sync::MutexGuard<'a, T>, MemtableError> {
+    mutex
+        .lock()
+        .map_err(|e| MemtableError::Invariant(format!("Mutex poisoned: {:?}", e)))
+}
+
+fn periodic_metric_flush(metrics: Vec<Arc<Mutex<dyn MetricTracker>>>) {
+    loop {
+        for m in &metrics {
+            let result = m
+                .lock()
+                .map_err(|e| MemtableError::Invariant(format!("Mutex poisoned: {:?}", e)))
+                .and_then(|guard| guard.flush());
+            match result {
+                Ok(_) => {
+                    println!(
+                        "wrote metrics to file just fine! {:?}",
+                        time::Instant::now()
+                    )
+                }
+                Err(e) => {
+                    println!("Error writing metrics out, {:?}", e)
+                }
+            }
+        }
+        thread::sleep(time::Duration::new(10, 0));
+    }
+}
 impl Memtable {
     pub fn new() -> Result<Self, MemtableError> {
         let mut wal_result = WalManager::new(WRITE_AHEAD_LOG_FILE_NAME)?;
         let wal_contents = wal_result.drain()?;
-
+        let memory_tracker = Arc::new(Mutex::new(MemMetricTracker::new()?));
+        let disk_tracker = Arc::new(Mutex::new(DiskTreeMetricTracker::new()?));
         let mut mem = Memtable {
             wal: wal_result,
             in_memory_repr: BTreeMap::new(),
             config: None,
+            memory_metrics: Arc::clone(&memory_tracker),
+            disk_metrics: Arc::clone(&disk_tracker),
         };
         mem.rebuild_memtable(wal_contents)?;
+        let memory_tracker_clone = Arc::clone(&memory_tracker);
+        let disk_tracker_clone = Arc::clone(&disk_tracker);
+
+        thread::spawn(move || {
+            periodic_metric_flush(vec![
+                memory_tracker_clone as Arc<Mutex<dyn MetricTracker>>,
+                disk_tracker_clone as Arc<Mutex<dyn MetricTracker>>,
+            ]);
+        });
+
         Ok(mem)
     }
     // mainly just for testing
@@ -350,13 +405,17 @@ impl Memtable {
             wal: wal_manager,
             in_memory_repr: BTreeMap::new(),
             config: None,
+            memory_metrics: Arc::new(Mutex::new(MemMetricTracker::new().unwrap())),
+            disk_metrics: Arc::new(Mutex::new(DiskTreeMetricTracker::new().unwrap())),
         }
     }
 
     pub fn put(&mut self, key: &[u8], value: TableEntry) -> Result<(), MemtableError> {
         if self.should_flush() {
-            self.flush()?
+            self.flush()?;
+            lock_or_error(&self.memory_metrics)?.flush_counter += 1;
         }
+        lock_or_error(&self.memory_metrics)?.memtable_writes += 1;
         let mut wal_entry_repr = Vec::new();
         TransitiveRepr::new().to_wal_entry(&mut wal_entry_repr, key, WalEntry::Value(&value))?;
 
@@ -365,20 +424,49 @@ impl Memtable {
         Result::Ok(())
     }
     pub fn delete(&mut self, key: &[u8]) -> Result<(), MemtableError> {
+        if self.should_flush() {
+            self.flush()?;
+            lock_or_error(&self.memory_metrics)?.flush_counter += 1;
+        }
+        lock_or_error(&self.memory_metrics)?.memtable_writes += 1;
         let mut wal_entry_repr = Vec::new();
         TransitiveRepr::new().to_wal_entry(&mut wal_entry_repr, key, WalEntry::Tombstone())?;
         self.wal.write_entry(wal_entry_repr.as_slice())?;
         self.in_memory_repr.insert(key.to_vec(), None);
         Result::Ok(())
     }
-    pub fn get(&self, key: &[u8]) -> Result<&Option<TableEntry>, lsm::LsmTreeError> {
+    pub fn get(&self, key: &[u8]) -> Result<&Option<TableEntry>, MemtableError> {
+        lock_or_error(&self.memory_metrics)?.memtable_reads += 1;
         match self.in_memory_repr.get(key) {
-            None => return Err(lsm::LsmTreeError::Unimplemented()), // ! if it doesnt exist in memory, read from disk (tbd)
+            None => {
+                return {
+                    lock_or_error(&self.memory_metrics)?.lsm_reads += 1;
+                    // lsm-reader should return
+                    // # of ss-tables it read
+                    // # of lsm-tree levels it traversed
+                    // self.metrics.ss_table_reads += lsm_reader()
+                    // just log out how many ss_tables this request took, caller doesnt care
+                    Err(MemtableError::LsmTreeError(
+                        lsm::LsmTreeError::Unimplemented(),
+                    ))
+                };
+            } // ! if it doesnt exist in memory, read from disk (tbd)
             Some(value) => Ok(value),
         }
     }
     // write in memory contents out to lsm tree as Level 0
-    fn flush(&mut self) -> Result<(), lsm::LsmTreeError> {
+    fn flush(&mut self) -> Result<(), MemtableError> {
+        let start = time::Instant::now();
+
+        /*
+
+
+
+        */
+
+        lock_or_error(&self.memory_metrics)?
+            .flush_duration
+            .push(start.elapsed());
         Result::Ok(())
     }
     // read from WAL and reconstruct memtable
@@ -545,15 +633,138 @@ impl ConfigInfo {
         Ok(())
     }
 }
-// This will be useful when we are flushing to disk
-// output elements in sorted order <low key -> high key)
-impl Iterator for Memtable {
-    type Item = Option<Vec<u8>>;
-    fn next(&mut self) -> Option<Self::Item> {
-        Some(Some(vec![8u8]))
-    }
+trait MetricTracker: Send + Sync {
+    fn flush(&self) -> Result<(), MemtableError>;
 }
 
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub(crate) struct MemMetricTracker {
+    pub(crate) memtable_reads: u64,
+    pub(crate) lsm_reads: u64,
+    pub(crate) ss_table_reads: u64, //(for global data, will also be a local one for GET request)
+    // writes
+    pub(crate) memtable_writes: u64,
+    pub(crate) flush_counter: u64,
+    //auxiliary
+    pub(crate) flush_duration: Vec<time::Duration>,
+}
+// lsm-tree (ss-tables)
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub(crate) struct DiskTreeMetricTracker {
+    pub(crate) total_ss_tables_merged: u64,
+    pub(crate) merge_output_size: Vec<u64>,
+}
+impl MemMetricTracker {
+    const FILEPATH: &str = "tmp/memory_metrics.json";
+    pub(crate) fn new() -> Result<Self, MemtableError> {
+        let content = match fs::read(Self::FILEPATH) {
+            Ok(data) => data,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if content.is_empty() {
+            return Ok(Self::default());
+        }
+        let tracker: MemMetricTracker = serde_json::from_slice(&content)?;
+        Ok(tracker)
+    }
+
+    pub(crate) fn flush_metrics(&self) -> Result<(), MemtableError> {
+        let json_data = serde_json::to_string_pretty(self)?;
+        if let Some(parent) = std::path::Path::new(Self::FILEPATH).parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(Self::FILEPATH, json_data)?;
+        Ok(())
+    }
+
+    pub(crate) fn new_with_file_path(filepath: &str) -> Result<Self, MemtableError> {
+        let content = match fs::read(filepath) {
+            Ok(data) => data,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if content.is_empty() {
+            return Ok(Self::default());
+        }
+        let tracker: MemMetricTracker = serde_json::from_slice(&content)?;
+        Ok(tracker)
+    }
+
+    pub(crate) fn flush_metrics_with_fp(&self, filepath: &str) -> Result<(), MemtableError> {
+        let json_data = serde_json::to_string_pretty(self)?;
+        if let Some(parent) = std::path::Path::new(filepath).parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(filepath, json_data)?;
+        Ok(())
+    }
+}
+impl MetricTracker for MemMetricTracker {
+    fn flush(&self) -> Result<(), MemtableError> {
+        self.flush_metrics()
+    }
+}
+impl DiskTreeMetricTracker {
+    const FILEPATH: &str = "tmp/disk_metrics.json";
+    fn new() -> Result<Self, MemtableError> {
+        let content = match fs::read(Self::FILEPATH) {
+            Ok(data) => data,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if content.is_empty() {
+            return Ok(Self::default());
+        }
+        let tracker: DiskTreeMetricTracker = serde_json::from_slice(&content)?;
+        Ok(tracker)
+    }
+
+    fn flush_metrics(&self) -> Result<(), MemtableError> {
+        let json_data = serde_json::to_string_pretty(self)?;
+        if let Some(parent) = std::path::Path::new(Self::FILEPATH).parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(Self::FILEPATH, json_data)?;
+        Ok(())
+    }
+
+    pub(crate) fn new_with_file_path(filepath: &str) -> Result<Self, MemtableError> {
+        let content = match fs::read(filepath) {
+            Ok(data) => data,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if content.is_empty() {
+            return Ok(Self::default());
+        }
+        let tracker: DiskTreeMetricTracker = serde_json::from_slice(&content)?;
+        Ok(tracker)
+    }
+
+    pub(crate) fn flush_metrics_with_fp(&self, filepath: &str) -> Result<(), MemtableError> {
+        let json_data = serde_json::to_string_pretty(self)?;
+        if let Some(parent) = std::path::Path::new(filepath).parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(filepath, json_data)?;
+        Ok(())
+    }
+}
+impl MetricTracker for DiskTreeMetricTracker {
+    fn flush(&self) -> Result<(), MemtableError> {
+        self.flush_metrics()
+    }
+}
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct WalManager {
@@ -572,8 +783,7 @@ impl From<std::io::Error> for WalError {
         WalError::IoErr(e)
     }
 }
-use std::fs;
-use std::io::{self, ErrorKind, Read, Seek, Write};
+
 #[allow(dead_code)]
 impl WalManager {
     pub fn new(file_name: &str) -> Result<Self, WalError> {

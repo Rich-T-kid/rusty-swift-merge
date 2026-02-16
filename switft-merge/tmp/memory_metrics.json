@@ -1,0 +1,8 @@
+{
+  "memtable_reads": 1,
+  "lsm_reads": 0,
+  "ss_table_reads": 0,
+  "memtable_writes": 2,
+  "flush_counter": 0,
+  "flush_duration": []
+}
