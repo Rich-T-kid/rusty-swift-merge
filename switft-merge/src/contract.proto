@@ -14,7 +14,6 @@ package swiftmerge.v01;
 import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
 
-
 service LSMDB{
   rpc HealthCheck(google.protobuf.Empty) returns (GenericResponse);
   rpc Put(PutRequest) returns (GenericResponse); 
