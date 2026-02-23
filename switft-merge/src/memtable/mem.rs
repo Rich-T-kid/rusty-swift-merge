@@ -339,6 +339,7 @@ pub enum WalEntry<'a> {
 pub enum ConfigSource<'a> {
     FileSource(&'a String),
     RawBytes(Vec<u8>),
+    Default(),
 }
 
 // Helper function to handle poisoned mutex
@@ -358,22 +359,18 @@ fn periodic_metric_flush(metrics: Vec<Arc<Mutex<dyn MetricTracker>>>) {
                 .map_err(|e| MemtableError::Invariant(format!("Mutex poisoned: {:?}", e)))
                 .and_then(|guard| guard.flush());
             match result {
-                Ok(_) => {
-                    println!(
-                        "wrote metrics to file just fine! {:?}",
-                        time::Instant::now()
-                    )
-                }
+                Ok(_) => {}
                 Err(e) => {
                     println!("Error writing metrics out, {:?}", e)
                 }
             }
         }
-        thread::sleep(time::Duration::new(10, 0));
+        thread::sleep(time::Duration::new(60, 0));
     }
 }
 impl Memtable {
-    pub fn new() -> Result<Self, MemtableError> {
+    // ! update new() to take in ConfigSource, should be configured here
+    pub fn new(config: ConfigSource) -> Result<Self, MemtableError> {
         let mut wal_result = WalManager::new(WRITE_AHEAD_LOG_FILE_NAME)?;
         let wal_contents = wal_result.drain()?;
         let memory_tracker = Arc::new(Mutex::new(MemMetricTracker::new()?));
@@ -385,6 +382,8 @@ impl Memtable {
             memory_metrics: Arc::clone(&memory_tracker),
             disk_metrics: Arc::clone(&disk_tracker),
         };
+        mem.update_config(config)?;
+        let _: bool = mem.config.as_ref().unwrap().local_disk;
         mem.rebuild_memtable(wal_contents)?;
         let memory_tracker_clone = Arc::clone(&memory_tracker);
         let disk_tracker_clone = Arc::clone(&disk_tracker);
@@ -564,8 +563,31 @@ impl Memtable {
                 config.validate()?;
                 self.config = Some(config);
             }
-            _ => {
-                todo!()
+            ConfigSource::RawBytes(raw_bytes) => {
+                let config_as_str = String::from_utf8(raw_bytes).map_err(|_| {
+                    MemtableError::InitError(MemInitError::InvalidFormat(
+                        "Invalid UTF-8 in raw bytes".to_string(),
+                    ))
+                })?;
+                if config_as_str.len() == 0 {
+                    return Err(MemtableError::InitError(MemInitError::MissingConfig()));
+                }
+                let mut config: ConfigInfo = serde_json::from_str(&config_as_str)?;
+                config.validate()?;
+                self.config = Some(config);
+            }
+            ConfigSource::Default() => {
+                let config = ConfigInfo {
+                    ram_max_size: 20480,
+                    ram_max_time: 600,
+                    target_chunks: 4,
+                    compaction_check_interval_seconds: 3600,
+                    wal_enabled: true,
+                    bloom_false_positive_rate: 0.05,
+                    max_compaction_threads: 2,
+                    local_disk: true,
+                };
+                self.config = Some(config);
             }
         }
         Ok(())
@@ -581,6 +603,7 @@ struct ConfigInfo {
     wal_enabled: bool,
     bloom_false_positive_rate: f64,
     max_compaction_threads: u8,
+    local_disk: bool,
 }
 impl ConfigInfo {
     const KILOBYTE: u32 = 1024;

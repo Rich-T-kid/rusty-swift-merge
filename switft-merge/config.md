@@ -54,3 +54,8 @@
 2. **higher values speed up compaction but use more system resources**
 3. **(min,max) -> (1,system_thread_max)**
 4. **should fit in u8**
+
+### _localDiskWAL_
+
+1. **represents weather to store WAL entries on local file system or on cloud storage**
+2. **bool**

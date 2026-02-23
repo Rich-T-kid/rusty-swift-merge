@@ -1,8 +1,8 @@
 {
-  "memtable_reads": 1,
+  "memtable_reads": 0,
   "lsm_reads": 0,
   "ss_table_reads": 0,
-  "memtable_writes": 2,
+  "memtable_writes": 0,
   "flush_counter": 0,
   "flush_duration": []
 }
