@@ -383,7 +383,7 @@ impl Memtable {
             disk_metrics: Arc::clone(&disk_tracker),
         };
         mem.update_config(config)?;
-        let _: bool = mem.config.as_ref().unwrap().local_disk;
+        let _: bool = mem.config.as_ref().unwrap().local_disk; // pass this in when you spawn the background compaction thread
         mem.rebuild_memtable(wal_contents)?;
         let memory_tracker_clone = Arc::clone(&memory_tracker);
         let disk_tracker_clone = Arc::clone(&disk_tracker);
@@ -452,6 +452,19 @@ impl Memtable {
             } // ! if it doesnt exist in memory, read from disk (tbd)
             Some(value) => Ok(value),
         }
+    }
+    // this function assumes that the caller has already validated start > end
+    pub fn range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<(&Vec<u8>, &Option<TableEntry>)>, MemtableError> {
+        lock_or_error(&self.memory_metrics)?.memtable_reads += 1;
+        let mut found_table_entires = vec![];
+        for (key, value) in self.in_memory_repr.range(start.to_vec()..=end.to_vec()) {
+            found_table_entires.push((key, value));
+        }
+        Ok(found_table_entires)
     }
     // write in memory contents out to lsm tree as Level 0
     fn flush(&mut self) -> Result<(), MemtableError> {
@@ -590,6 +603,14 @@ impl Memtable {
                 self.config = Some(config);
             }
         }
+        Ok(())
+    }
+    pub fn shutdown(&mut self) -> Result<(), MemtableError> {
+        // clean up and then exit
+        //   not alot to do here going to keep here in case we may need to do some kind of clean up
+        // everything critical is on disk -> in the future may want to do something with logs
+        println!("{:?}", self.memory_metrics.lock().unwrap());
+        println!("{:?}", self.disk_metrics.lock().unwrap());
         Ok(())
     }
 }
@@ -1089,5 +1110,188 @@ mod config_test {
             }
             _ => panic!("Expected InvalidArgument error for ram_max_time"),
         }
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    // Basic range test - insert keys and query a range
+    #[test]
+    fn test_basic_range() {
+        let mut memtable =
+            Memtable::new(ConfigSource::Default()).expect("failed to create memtable");
+
+        // Insert entries with keys 10, 20, 30, 40, 50, 60, 70
+        for i in (10..=70).step_by(10) {
+            let key = vec![i as u8];
+            let value = format!("value_{}", i).into_bytes();
+            let entry = TableEntry::new(value, None);
+            memtable.put(&key, entry).expect("failed to put entry");
+        }
+
+        // Query range from 20 to 50 (should return 20, 30, 40, 50)
+        let start_key = vec![20u8];
+        let end_key = vec![50u8];
+        let results = memtable
+            .range(&start_key, &end_key)
+            .expect("range query failed");
+        println!("results vector : {:?}", results);
+        assert_eq!(results.len(), 4, "Expected 4 results in range");
+
+        // Verify the values
+        let expected_keys = vec![20u8, 30u8, 40u8, 50u8];
+        for (idx, (key, entry_opt)) in results.iter().enumerate() {
+            assert_eq!(
+                **key,
+                vec![expected_keys[idx]],
+                "Key mismatch at index {}",
+                idx
+            );
+            assert!(entry_opt.is_some(), "Expected non-None entry");
+            if let Some(entry) = entry_opt {
+                let expected_value = format!("value_{}", expected_keys[idx]).into_bytes();
+                assert_eq!(
+                    entry.value, expected_value,
+                    "Value mismatch at index {}",
+                    idx
+                );
+            }
+        }
+    }
+
+    // Non-basic range test - test edge cases and tombstones
+    #[test]
+    fn test_range_with_tombstones_and_edge_cases() {
+        let mut memtable =
+            Memtable::new(ConfigSource::Default()).expect("failed to create memtable");
+
+        // Insert entries with keys a, b, c, d, e, f, g
+        let keys = vec!["a", "b", "c", "d", "e", "f", "g"];
+        for key in &keys {
+            let value = format!("value_{}", key);
+            let entry = TableEntry::new(value.as_bytes().to_vec(), None);
+            memtable
+                .put(key.as_bytes(), entry)
+                .expect("failed to put entry");
+        }
+
+        // Delete keys "c" and "e" (tombstones)
+        memtable.delete(b"c").expect("failed to delete key c");
+        memtable.delete(b"e").expect("failed to delete key e");
+
+        // Query range from "b" to "f" (should return b, c(tombstone), d, e(tombstone), f)
+        let results = memtable.range(b"b", b"f").expect("range query failed");
+
+        // Verify entries
+        // b - should have value
+        assert_eq!(*results[0].0, b"b");
+        assert!(results[0].1.is_some());
+        assert_eq!(results[0].1.as_ref().unwrap().value, b"value_b");
+
+        // c - should be tombstone (None)
+        assert_eq!(*results[1].0, b"c");
+        assert!(results[1].1.is_none(), "Expected tombstone for key c");
+
+        // d - should have value
+        assert_eq!(*results[2].0, b"d");
+        assert!(results[2].1.is_some());
+        assert_eq!(results[2].1.as_ref().unwrap().value, b"value_d");
+
+        // e - should be tombstone (None)
+        assert_eq!(*results[3].0, b"e");
+        assert!(results[3].1.is_none(), "Expected tombstone for key e");
+
+        // f - should have value
+        assert_eq!(*results[4].0, b"f");
+        assert!(results[4].1.is_some());
+        assert_eq!(results[4].1.as_ref().unwrap().value, b"value_f");
+
+        // Test empty range (no keys in range)
+        let results = memtable.range(b"h", b"z").expect("range query failed");
+        assert_eq!(results.len(), 0, "Expected 0 results for empty range");
+
+        // Test range that includes only one key
+        let results = memtable.range(b"a", b"a").expect("range query failed");
+        assert_eq!(results.len(), 1, "Expected 1 result for single key range");
+        assert_eq!(*results[0].0, b"a");
+        assert!(results[0].1.is_some());
+        assert_eq!(results[0].1.as_ref().unwrap().value, b"value_a");
+    }
+
+    // Test specifically for tombstones in range queries
+    #[test]
+    fn test_range_tombstone_returns() {
+        let mut memtable =
+            Memtable::new(ConfigSource::Default()).expect("failed to create memtable");
+
+        // Insert 5 entries: key_100, key_200, key_300, key_400, key_500
+        for i in 1..=5 {
+            let key = format!("key_{}", i * 100).into_bytes();
+            let value = format!("value_{}", i * 100).into_bytes();
+            let entry = TableEntry::new(value, None);
+            memtable.put(&key, entry).expect("failed to put entry");
+        }
+
+        // Delete key_200 and key_400 (create tombstones)
+        memtable
+            .delete(b"key_200")
+            .expect("failed to delete key_200");
+        memtable
+            .delete(b"key_400")
+            .expect("failed to delete key_400");
+
+        // Query range from key_100 to key_500 (all 5 keys)
+        let results = memtable
+            .range(b"key_100", b"key_500")
+            .expect("range query failed");
+
+        // Should return all 5 entries (including 2 tombstones)
+        assert_eq!(
+            results.len(),
+            5,
+            "Expected 5 results (3 values + 2 tombstones)"
+        );
+
+        // Verify key_100 exists
+        assert_eq!(*results[0].0, b"key_100");
+        assert!(
+            results[0].1.is_some(),
+            "Expected key_100 to exist (not a tombstone)"
+        );
+        assert_eq!(results[0].1.as_ref().unwrap().value, b"value_100");
+
+        // Verify key_200 is a tombstone (None)
+        assert_eq!(*results[1].0, b"key_200");
+        assert!(
+            results[1].1.is_none(),
+            "Expected key_200 to be a tombstone (None)"
+        );
+
+        // Verify key_300 exists
+        assert_eq!(*results[2].0, b"key_300");
+        assert!(
+            results[2].1.is_some(),
+            "Expected key_300 to exist (not a tombstone)"
+        );
+        assert_eq!(results[2].1.as_ref().unwrap().value, b"value_300");
+
+        // Verify key_400 is a tombstone (None)
+        assert_eq!(*results[3].0, b"key_400");
+        assert!(
+            results[3].1.is_none(),
+            "Expected key_400 to be a tombstone (None)"
+        );
+
+        // Verify key_500 exists
+        assert_eq!(*results[4].0, b"key_500");
+        assert!(
+            results[4].1.is_some(),
+            "Expected key_500 to exist (not a tombstone)"
+        );
+        assert_eq!(results[4].1.as_ref().unwrap().value, b"value_500");
+
+        println!("Tombstone test passed: range correctly returns None for deleted keys");
     }
 }

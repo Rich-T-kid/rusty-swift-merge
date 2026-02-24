@@ -15,7 +15,7 @@ import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
 
 service LSMDB{
-  rpc HealthCheck(google.protobuf.Empty) returns (GenericResponse);
+  rpc HealthCheck(google.protobuf.Empty) returns (HealthCheckResponse);
   rpc Put(PutRequest) returns (GenericResponse); 
   rpc Delete(DeleteRequest) returns (GenericResponse); 
   rpc BatchWrite(BatchWriteRequest) returns (GenericResponse);
