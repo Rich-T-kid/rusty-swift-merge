@@ -450,21 +450,23 @@ impl Memtable {
                     ))
                 };
             } // ! if it doesnt exist in memory, read from disk (tbd)
+            // ! also increment memory_metrics.total_misses if it doesnt exist on disk
             Some(value) => Ok(value),
         }
     }
-    // this function assumes that the caller has already validated start > end
+    // this function assumes that the caller has already validated start <= end
     pub fn range(
         &self,
         start: &[u8],
         end: &[u8],
     ) -> Result<Vec<(&Vec<u8>, &Option<TableEntry>)>, MemtableError> {
+        // ! need to include lsm tree read
         lock_or_error(&self.memory_metrics)?.memtable_reads += 1;
-        let mut found_table_entires = vec![];
+        let mut found_table_entries = vec![];
         for (key, value) in self.in_memory_repr.range(start.to_vec()..=end.to_vec()) {
-            found_table_entires.push((key, value));
+            found_table_entries.push((key, value));
         }
-        Ok(found_table_entires)
+        Ok(found_table_entries)
     }
     // write in memory contents out to lsm tree as Level 0
     fn flush(&mut self) -> Result<(), MemtableError> {
@@ -565,8 +567,10 @@ impl Memtable {
     }
     // should be able to handle a file or a load of bytes (grpc call)
     pub fn update_config(&mut self, content: ConfigSource) -> Result<(), MemtableError> {
+        println!("inside update config");
         match content {
             ConfigSource::FileSource(name) => {
+                println!("1");
                 let config_as_str = fs::read_to_string(name)
                     .map_err(|_| MemtableError::InitError(MemInitError::MissingConfig()))?;
                 if config_as_str.len() == 0 {
@@ -577,6 +581,7 @@ impl Memtable {
                 self.config = Some(config);
             }
             ConfigSource::RawBytes(raw_bytes) => {
+                println!("2");
                 let config_as_str = String::from_utf8(raw_bytes).map_err(|_| {
                     MemtableError::InitError(MemInitError::InvalidFormat(
                         "Invalid UTF-8 in raw bytes".to_string(),
@@ -590,6 +595,7 @@ impl Memtable {
                 self.config = Some(config);
             }
             ConfigSource::Default() => {
+                println!("3");
                 let config = ConfigInfo {
                     ram_max_size: 20480,
                     ram_max_time: 600,
@@ -609,9 +615,27 @@ impl Memtable {
         // clean up and then exit
         //   not alot to do here going to keep here in case we may need to do some kind of clean up
         // everything critical is on disk -> in the future may want to do something with logs
-        println!("{:?}", self.memory_metrics.lock().unwrap());
-        println!("{:?}", self.disk_metrics.lock().unwrap());
+        let memory_metrics_guard = self.memory_metrics.lock().map_err(|_| {
+            MemtableError::from(io::Error::new(
+                ErrorKind::Other,
+                "memory_metrics lock poisoned during shutdown",
+            ))
+        })?;
+        log::info!("Memory metrics at shutdown: {:?}", *memory_metrics_guard);
+        let disk_metrics_guard = self.disk_metrics.lock().map_err(|_| {
+            MemtableError::from(io::Error::new(
+                ErrorKind::Other,
+                "disk_metrics lock poisoned during shutdown",
+            ))
+        })?;
+        log::info!("Disk metrics at shutdown: {:?}", *disk_metrics_guard);
         Ok(())
+    }
+    pub fn metrics(&self) -> (Arc<MemMetricTracker>, Arc<DiskTreeMetricTracker>) {
+        (
+            Arc::new(self.memory_metrics.lock().unwrap().clone()),
+            Arc::new(self.disk_metrics.lock().unwrap().clone()),
+        )
     }
 }
 #[derive(Serialize, Deserialize, Debug)]
@@ -681,11 +705,13 @@ trait MetricTracker: Send + Sync {
     fn flush(&self) -> Result<(), MemtableError>;
 }
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[serde(default)]
 pub(crate) struct MemMetricTracker {
     pub(crate) memtable_reads: u64,
     pub(crate) lsm_reads: u64,
     pub(crate) ss_table_reads: u64, //(for global data, will also be a local one for GET request)
+    pub(crate) total_misses: u64,
     // writes
     pub(crate) memtable_writes: u64,
     pub(crate) flush_counter: u64,
@@ -694,10 +720,12 @@ pub(crate) struct MemMetricTracker {
 }
 // lsm-tree (ss-tables)
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[serde(default)]
 pub(crate) struct DiskTreeMetricTracker {
     pub(crate) total_ss_tables_merged: u64,
     pub(crate) merge_output_size: Vec<u64>,
+    pub(crate) ss_table_count: u64,
 }
 impl MemMetricTracker {
     const FILEPATH: &str = "tmp/memory_metrics.json";

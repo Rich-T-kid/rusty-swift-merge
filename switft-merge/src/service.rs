@@ -1,4 +1,5 @@
 use crate::memtable::mem::{Memtable, TableEntry, TrueTypes, TypeInfoMetadata};
+use crate::service::swiftmerge::{ReadStatsResponse, WriteMetrics};
 use log::{info, warn};
 use simplelog::*;
 use std::collections::{self, BTreeMap, HashMap, HashSet};
@@ -221,9 +222,18 @@ impl Lsmdb for MyLsmDb {
         &self,
         _request: Request<WriteMetricsRequest>,
     ) -> Result<Response<WriteMetricsResponse>, Status> {
-        Err(Status::unimplemented(
-            "metrics not yet implemented in backend",
-        ))
+        let req = _request.into_inner();
+        info!("write-metrics request recievied {:?}", req);
+        let (mem_metrics, disk_metrics) = self.db.lock().unwrap().metrics();
+
+        Ok(Response::new(WriteMetricsResponse {
+            write_response: Some(WriteMetrics {
+                total_writes: mem_metrics.memtable_writes,
+                ss_table_count: disk_metrics.ss_table_count,
+                ss_table_merged: disk_metrics.total_ss_tables_merged,
+            }),
+            avg_response: None,
+        }))
     }
 
     // metrics are not yet tracked by the backend storage
@@ -231,9 +241,18 @@ impl Lsmdb for MyLsmDb {
         &self,
         _request: Request<ReadMetricsRequest>,
     ) -> Result<Response<ReadMetricsResponse>, Status> {
-        Err(Status::unimplemented(
-            "metrics not yet implemented in backend",
-        ))
+        let req = _request.into_inner();
+        info!("read-metrics request recievied {:?}", req);
+        let (mem_metrics, _) = self.db.lock().unwrap().metrics();
+
+        Ok(Response::new(ReadMetricsResponse {
+            read_response: Some(ReadStatsResponse {
+                memtable_reads: mem_metrics.memtable_reads,
+                lsm_tree_reads: mem_metrics.lsm_reads,
+                total_misses: mem_metrics.total_misses,
+            }),
+            avg_response: None,
+        }))
     }
 
     async fn health_check(
