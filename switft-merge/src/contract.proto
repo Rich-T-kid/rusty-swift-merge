@@ -1,22 +1,11 @@
-/*
-things to add:  
-- batch put / delete ->  | X
-- range get  -> | X 
-- graceful shutdown rpc -> | X
-- add config realod rpc -> | X
-- add health check rpc (for liveness / readiness probes)
-
-these are backwards compatible additions so i will add them later
-*/
 syntax = "proto3";
 
 package swiftmerge.v01;
 import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
 
-
 service LSMDB{
-  rpc HealthCheck(google.protobuf.Empty) returns (GenericResponse);
+  rpc HealthCheck(google.protobuf.Empty) returns (HealthCheckResponse);
   rpc Put(PutRequest) returns (GenericResponse); 
   rpc Delete(DeleteRequest) returns (GenericResponse); 
   rpc BatchWrite(BatchWriteRequest) returns (GenericResponse);
@@ -86,7 +75,6 @@ message AverageLatency{
 }
 message SuccessfulWritesMetric{
   bool use = 1;
-  uint64 write_ahead_log = 2;
   uint64 memtable = 3;
   // if mins == 0  => return all results
   uint64 mins = 4; // keep this strictly defined (1 min , 5 , 10 , 30 )
@@ -96,8 +84,9 @@ message WriteMetricsResponse{
   AverageLatencyResponse avg_response = 4;
 }
 message WriteMetrics{
-  uint64 wal_count = 1;
-  uint64 memtable_count = 2;
+  uint64 total_writes = 1;
+  uint64 ss_table_count = 2;
+  uint64 ss_table_merged = 3;
 }
 message AverageLatencyResponse{
   uint64 latency = 1;

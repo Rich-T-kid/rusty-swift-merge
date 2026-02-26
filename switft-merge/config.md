@@ -55,7 +55,7 @@
 3. **(min,max) -> (1,system_thread_max)**
 4. **should fit in u8**
 
-### _localDiskWAL_
+### _localDisk_
 
-1. **represents weather to store WAL entries on local file system or on cloud storage**
+1. **represents weather to store SS-tables on local file system or on cloud storage**
 2. **bool**
