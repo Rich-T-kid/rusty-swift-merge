@@ -2,6 +2,7 @@ use crate::lsm_tree::disk;
 use std::fmt::Display;
 
 use super::lsm;
+use prost::bytes::buf;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 //use std::ffi::os_str::Display;
@@ -15,6 +16,7 @@ pub const WRITE_AHEAD_LOG_FILE_NAME: &str = "Wal.tmp";
 pub const TOMB_STONE_BYTE_REPRESENTATION: u8 = 255;
 pub const META_DATA_MAP_DOESNT_EXIST: u8 = 0u8;
 pub const META_DATA_MAP_EXIST: u8 = 1u8;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TrueTypes {
     Unspecified,
@@ -68,7 +70,7 @@ impl TypeInfoMetadata {
         TypeInfoMetadata { raw, true_type }
     }
 }
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TableEntry {
     pub value: Vec<u8>,
     pub meta_data: Option<BTreeMap<String, TypeInfoMetadata>>,
@@ -282,7 +284,7 @@ pub enum MemtableError {
     InitError(MemInitError),
     Invariant(String),
     WriteAheadLog(WalError),
-    LsmTreeError(lsm::LsmTreeError),
+    FlushErr(String),
     MissingKey(),
 }
 /*
@@ -300,11 +302,6 @@ impl From<WalError> for MemtableError {
 impl From<std::io::Error> for MemtableError {
     fn from(value: std::io::Error) -> Self {
         MemtableError::WriteAheadLog(WalError::IoErr(value))
-    }
-}
-impl From<lsm::LsmTreeError> for MemtableError {
-    fn from(value: lsm::LsmTreeError) -> Self {
-        Self::LsmTreeError(value)
     }
 }
 impl From<serde_json::Error> for MemtableError {
@@ -398,7 +395,9 @@ impl Memtable {
         };
         mem.update_config(config)?;
         let _: bool = mem.config.as_ref().unwrap().local_disk; // pass this in when you spawn the background compaction thread
-        mem.rebuild_memtable(wal_contents)?;
+        if mem.config.as_ref().unwrap().wal_enabled {
+            mem.rebuild_memtable(wal_contents)?;
+        }
         let memory_tracker_clone = Arc::clone(&memory_tracker);
         let disk_tracker_clone = Arc::clone(&disk_tracker);
 
@@ -425,29 +424,85 @@ impl Memtable {
         }
     }
 
+    // Helper function to get the size of an existing entry
+    fn get_existing_entry_size(&self, key: &[u8]) -> Option<usize> {
+        if let Some(value_opt) = self.in_memory_repr.get(key) {
+            let mut buffer = Vec::new();
+            let wal_entry = match value_opt {
+                Some(entry) => WalEntry::Value(entry),
+                None => WalEntry::Tombstone(),
+            };
+            // Calculate size of existing entry
+            if TransitiveRepr::new()
+                .to_wal_entry(&mut buffer, key, wal_entry)
+                .is_ok()
+            {
+                return Some(buffer.len());
+            }
+        }
+        None
+    }
+
     pub fn put(&mut self, key: &[u8], value: TableEntry) -> Result<(), MemtableError> {
-        self.manage_flush()?;
         lock_or_error(&self.memory_metrics)?.memtable_writes += 1;
+
+        // Get size of existing entry if it exists
+        let existing_size = self.get_existing_entry_size(key);
+
         let mut wal_entry_repr = Vec::new();
         TransitiveRepr::new().to_wal_entry(&mut wal_entry_repr, key, WalEntry::Value(&value))?;
         if self.config.as_ref().unwrap().wal_enabled {
             self.wal.write_entry(wal_entry_repr.as_slice())?;
         }
-        println!("new entry of size {}", wal_entry_repr.len() as u32);
-        self.current_size_bytes += wal_entry_repr.len() as u32; // doesnt account for duplicate keys that get overwritten
+
+        let new_entry_size = wal_entry_repr.len() as u32;
+
+        // Update current_size_bytes based on size difference
+        if let Some(old_size) = existing_size {
+            let old_size = old_size as u32;
+            if new_entry_size > old_size {
+                self.current_size_bytes += new_entry_size - old_size;
+            } else {
+                self.current_size_bytes -= old_size - new_entry_size;
+            }
+        } else {
+            // New entry, just add the size
+            self.current_size_bytes += new_entry_size;
+        }
+
         self.in_memory_repr.insert(key.to_vec(), Some(value));
+        self.manage_flush()?;
         Result::Ok(())
     }
     pub fn delete(&mut self, key: &[u8]) -> Result<(), MemtableError> {
-        self.manage_flush()?;
         lock_or_error(&self.memory_metrics)?.memtable_writes += 1;
+
+        // Get size of existing entry if it exists
+        let existing_size = self.get_existing_entry_size(key);
+
         let mut wal_entry_repr = Vec::new();
         TransitiveRepr::new().to_wal_entry(&mut wal_entry_repr, key, WalEntry::Tombstone())?;
         if self.config.as_ref().unwrap().wal_enabled {
             self.wal.write_entry(wal_entry_repr.as_slice())?;
         }
-        self.current_size_bytes += wal_entry_repr.len() as u32;
+
+        let tombstone_size = wal_entry_repr.len() as u32;
+
+        // Update current_size_bytes based on size difference
+        if let Some(old_size) = existing_size {
+            let old_size = old_size as u32;
+            if tombstone_size > old_size {
+                self.current_size_bytes += tombstone_size - old_size;
+            } else {
+                self.current_size_bytes -= old_size - tombstone_size;
+            }
+        } else {
+            // New tombstone entry, just add the size
+            self.current_size_bytes += tombstone_size;
+        }
+
         self.in_memory_repr.insert(key.to_vec(), None);
+        self.manage_flush()?;
         Result::Ok(())
     }
     // ! should just return
@@ -458,10 +513,9 @@ impl Memtable {
                 return {
                     // ! do not read from disk here
                     // return MemtableError:MissingKey caller will match on this
-                    lock_or_error(&self.memory_metrics)?.lsm_reads += 1;
-                    Err(MemtableError::LsmTreeError(
-                        lsm::LsmTreeError::Unimplemented(),
-                    ))
+                    Err(MemtableError::Invariant(format!(
+                        "remove later and refactor"
+                    )))
                 };
             } // ! if it doesnt exist in memory, read from disk (tbd)
             // ! also increment memory_metrics.total_misses if it doesnt exist on disk
@@ -486,24 +540,137 @@ impl Memtable {
     fn flush(&mut self) -> Result<(), MemtableError> {
         let start = time::Instant::now();
         println!("starting flushing to ss-table");
-        /*
-        (Issue #10 [https://github.com/Rich-T-kid/rusty-swift-merge/issues/10])
-        Open /data directory
-        create in memory buffer/vector
-        Set up header
-        iterate through btreeMap and for each entry serialize it
-        write out vector to file
-         */
-        /*
-        clear state
-        should the metrics be reset here?
-        */
+        if self.in_memory_repr.is_empty() {
+            return Err(MemtableError::FlushErr(format!(
+                "Cannot flush an empty tree"
+            )));
+        }
+
+        // Open /data directory
+        let data_dir = std::path::Path::new("data");
+        if !data_dir.exists() {
+            fs::create_dir_all(data_dir)?;
+        }
+
+        // Create /data/l1 subdirectory if it doesn't exist
+        let l1_dir = data_dir.join("l1");
+        if !l1_dir.exists() {
+            fs::create_dir_all(&l1_dir)?;
+        }
+
+        // Create SS-table file with timestamp
+        let timestamp = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let filename = format!("ss-table-entry_{}.bin", timestamp);
+        let filepath = l1_dir.join(filename);
+
+        // ! build out the data buffer here [need to do research on on disk format]
+        // Create buffer for SS-table contents
+        let mut buffer: Vec<u8> = Vec::new();
+        // header crc
+        buffer.write(disk::HEADER_CRC.as_bytes())?;
+        // bloom filter
+        let filter = disk::BloomGenerator::generate_filter(&self.in_memory_repr);
+        buffer.write(&filter)?;
+        // construct sparse index
+        let page_size = page_size::get();
+        let target_block_size = page_size * disk::PAGE_PER_BLOCK;
+        let size = self.current_size_bytes as usize;
+        let sparse_index_size = page_size / size;
+        println!("page size: {page_size}");
+        println!("target block size : {target_block_size}");
+        println!("memory size: {size}");
+        println!("sparse idndex size: {sparse_index_size}");
+        let mut ss_table_buffer: Vec<u8> = Vec::new();
+        let mut sparse_index_array: Vec<(usize, &Vec<u8>)> = Vec::new(); // (offset,key)
+        let mut block_bytes = 0;
+        let mut entry_count = 0;
+
+        // Iterate through BTreeMap and print k-v pairs
+        for (key, value_opt) in &self.in_memory_repr {
+            println!("i:{entry_count}");
+            entry_count += 1;
+
+            // always write the first entry to sparse index
+            if block_bytes == 0 {
+                sparse_index_array.push((ss_table_buffer.len(), key));
+            }
+
+            // deserialize key-value pair and write to buffer
+            let mut kv_buffer = Vec::new();
+            match value_opt.as_ref() {
+                Some(x) => {
+                    TransitiveRepr::new().to_wal_entry(&mut kv_buffer, key, WalEntry::Value(&x))?;
+                }
+                None => {
+                    TransitiveRepr::new().to_wal_entry(
+                        &mut kv_buffer,
+                        key,
+                        WalEntry::Tombstone(),
+                    )?;
+                }
+            }
+
+            let entry_size = kv_buffer.len();
+
+            // Check if adding this entry would exceed block size
+            if block_bytes > 0 && block_bytes + entry_size > target_block_size {
+                // Start a new block - add current position to sparse index
+                sparse_index_array.push((ss_table_buffer.len(), key));
+                block_bytes = 0;
+            }
+
+            // Actually write the entry to the buffer
+            ss_table_buffer.write_all(&kv_buffer)?;
+            block_bytes += entry_size;
+
+            println!("block bytes: {}", block_bytes);
+        }
+
+        println!("sparse index: {:?}", sparse_index_array);
+
+        // write sparse index to buffer
+        // format: sparse_index_size(u32)|key-len(u32)|key|offset(u64)|key-len(u32)|key|offset(u64)...
+
+        // First, serialize sparse index to a temporary buffer to get its size
+        let mut sparse_index_buffer = Vec::new();
+        for (offset, key) in &sparse_index_array {
+            let key_len = key.len() as u32;
+            sparse_index_buffer.write_all(&key_len.to_le_bytes())?;
+            sparse_index_buffer.write_all(key)?;
+            sparse_index_buffer.write_all(&(*offset as u64).to_le_bytes())?;
+        }
+
+        // Write the size of the sparse index content first
+        let sparse_index_content_size = sparse_index_buffer.len() as u32;
+        buffer.write_all(&sparse_index_content_size.to_le_bytes())?;
+
+        // Write the actual sparse index content
+        buffer.write_all(&sparse_index_buffer)?;
+        println!("pre data buffer:  {:?}", buffer);
+        buffer.write(&ss_table_buffer)?;
+        // Write buffer contents to file
+        let mut file = fs::File::create(&filepath)?;
+        file.write_all(&buffer)?;
+        file.sync_all()?;
+
+        println!("Successfully wrote SS-table to: {:?}", filepath);
+
         println!("finsihed flushing to disk, reseting state");
         self.flush_by = time::Instant::now()
             + time::Duration::from_secs(self.config.as_ref().unwrap().ram_max_time as u64);
         self.current_size_bytes = 0;
         self.in_memory_repr = BTreeMap::new();
-
+        self.memory_metrics
+            .lock()
+            .expect("failed to aquire lock")
+            .reset_metrics();
+        self.disk_metrics
+            .lock()
+            .expect("failed to aquire lock")
+            .reset_metrics();
         lock_or_error(&self.memory_metrics)?
             .flush_duration
             .push(start.elapsed());
@@ -583,6 +750,7 @@ impl Memtable {
             };
             self.in_memory_repr.insert(table_entry.0, table_entry.1);
         }
+        self.current_size_bytes = wal_content.len() as u32;
         Result::Ok(())
     }
 
@@ -602,10 +770,6 @@ impl Memtable {
         {
             return true;
         }
-        println!(
-            "dont need to flush, curr memory size: {} \n instant_to_flush: {:?}",
-            self.current_size_bytes, self.flush_by
-        );
         false
     }
     // this reloads the self.flush by counter
@@ -636,11 +800,11 @@ impl Memtable {
             }
             ConfigSource::Default() => {
                 let config = ConfigInfo {
-                    ram_max_size: 20480,
+                    ram_max_size: 70_000, // ! change back when pushing ! have this be a factor of TARGET_BLOCK_SIZE so 65k or so
                     ram_max_time: 600,
                     target_chunks: 4,
                     compaction_check_interval_seconds: 3600,
-                    wal_enabled: true,
+                    wal_enabled: false, // ! change back when pushing (mabey)
                     bloom_false_positive_rate: 0.05,
                     max_compaction_threads: 2,
                     local_disk: true,
@@ -817,6 +981,15 @@ impl MemMetricTracker {
         fs::write(filepath, json_data)?;
         Ok(())
     }
+    fn reset_metrics(&mut self) {
+        self.memtable_reads = 0;
+        self.lsm_reads = 0;
+        self.ss_table_reads = 0;
+        self.total_misses = 0;
+        self.memtable_writes = 0;
+        self.flush_counter = 0;
+        self.flush_duration.clear();
+    }
 }
 impl MetricTracker for MemMetricTracker {
     fn flush(&self) -> Result<(), MemtableError> {
@@ -871,6 +1044,12 @@ impl DiskTreeMetricTracker {
         }
         fs::write(filepath, json_data)?;
         Ok(())
+    }
+
+    fn reset_metrics(&mut self) {
+        self.total_ss_tables_merged = 0;
+        self.merge_output_size.clear();
+        self.ss_table_count = 0;
     }
 }
 impl MetricTracker for DiskTreeMetricTracker {
@@ -1362,5 +1541,27 @@ mod range_tests {
         assert_eq!(results[4].1.as_ref().unwrap().value, b"value_500");
 
         println!("Tombstone test passed: range correctly returns None for deleted keys");
+    }
+}
+
+mod flush_test {
+    use super::*;
+
+    #[test]
+    fn test_flush_single_entry() {
+        let mut memtable =
+            Memtable::new(ConfigSource::Default()).expect("failed to create memtable");
+
+        // Create a 200-byte entry
+        let value = vec![0u8; 10_000];
+        for i in 0..8 {
+            let key = format!("test_key_{i}");
+            let entry = TableEntry::new(value.clone(), None);
+            memtable
+                .put(key.as_bytes(), entry)
+                .expect("failed to put entry");
+        }
+
+        // TODO: Add assertions and flush verification
     }
 }
