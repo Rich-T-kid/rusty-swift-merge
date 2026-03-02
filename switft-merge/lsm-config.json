@@ -1,5 +1,5 @@
 {
-    "ramMaxSize": 20480,
+    "ramMaxSize": 1024,
     "ramMaxTime": 600,
     "targetChunks": 4,
     "compactionCheckIntervalSeconds": 3600,

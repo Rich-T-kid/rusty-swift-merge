@@ -57,5 +57,5 @@
 
 ### _localDisk_
 
-1. **represents weather to store SS-tables on local file system or on cloud storage**
+1. **represents wheather to store SS-tables on local file system or on cloud storage**
 2. **bool**

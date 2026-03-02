@@ -1,8 +1,10 @@
 use crate::lsm_tree::disk;
+use std::fmt::Display;
 
 use super::lsm;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+//use std::ffi::os_str::Display;
 use std::io::{self, ErrorKind, Read, Seek, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -232,6 +234,8 @@ pub struct Memtable {
     config: Option<ConfigInfo>,
     memory_metrics: Arc<Mutex<MemMetricTracker>>,
     disk_metrics: Arc<Mutex<DiskTreeMetricTracker>>,
+    flush_by: time::Instant,
+    current_size_bytes: u32,
 }
 
 pub struct TransitiveRepr {}
@@ -279,7 +283,15 @@ pub enum MemtableError {
     Invariant(String),
     WriteAheadLog(WalError),
     LsmTreeError(lsm::LsmTreeError),
+    MissingKey(),
 }
+/*
+! todo | need to implement display for all nested types as well
+impl Display for MemtableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    }
+}
+*/
 impl From<WalError> for MemtableError {
     fn from(value: WalError) -> Self {
         Self::WriteAheadLog(value)
@@ -381,6 +393,8 @@ impl Memtable {
             config: None,
             memory_metrics: Arc::clone(&memory_tracker),
             disk_metrics: Arc::clone(&disk_tracker),
+            flush_by: time::Instant::now(),
+            current_size_bytes: 0,
         };
         mem.update_config(config)?;
         let _: bool = mem.config.as_ref().unwrap().local_disk; // pass this in when you spawn the background compaction thread
@@ -406,45 +420,45 @@ impl Memtable {
             config: None,
             memory_metrics: Arc::new(Mutex::new(MemMetricTracker::new().unwrap())),
             disk_metrics: Arc::new(Mutex::new(DiskTreeMetricTracker::new().unwrap())),
+            flush_by: time::Instant::now(),
+            current_size_bytes: 0,
         }
     }
 
     pub fn put(&mut self, key: &[u8], value: TableEntry) -> Result<(), MemtableError> {
-        if self.should_flush() {
-            self.flush()?;
-            lock_or_error(&self.memory_metrics)?.flush_counter += 1;
-        }
+        self.manage_flush()?;
         lock_or_error(&self.memory_metrics)?.memtable_writes += 1;
         let mut wal_entry_repr = Vec::new();
         TransitiveRepr::new().to_wal_entry(&mut wal_entry_repr, key, WalEntry::Value(&value))?;
-
-        self.wal.write_entry(wal_entry_repr.as_slice())?;
+        if self.config.as_ref().unwrap().wal_enabled {
+            self.wal.write_entry(wal_entry_repr.as_slice())?;
+        }
+        println!("new entry of size {}", wal_entry_repr.len() as u32);
+        self.current_size_bytes += wal_entry_repr.len() as u32; // doesnt account for duplicate keys that get overwritten
         self.in_memory_repr.insert(key.to_vec(), Some(value));
         Result::Ok(())
     }
     pub fn delete(&mut self, key: &[u8]) -> Result<(), MemtableError> {
-        if self.should_flush() {
-            self.flush()?;
-            lock_or_error(&self.memory_metrics)?.flush_counter += 1;
-        }
+        self.manage_flush()?;
         lock_or_error(&self.memory_metrics)?.memtable_writes += 1;
         let mut wal_entry_repr = Vec::new();
         TransitiveRepr::new().to_wal_entry(&mut wal_entry_repr, key, WalEntry::Tombstone())?;
-        self.wal.write_entry(wal_entry_repr.as_slice())?;
+        if self.config.as_ref().unwrap().wal_enabled {
+            self.wal.write_entry(wal_entry_repr.as_slice())?;
+        }
+        self.current_size_bytes += wal_entry_repr.len() as u32;
         self.in_memory_repr.insert(key.to_vec(), None);
         Result::Ok(())
     }
+    // ! should just return
     pub fn get(&self, key: &[u8]) -> Result<&Option<TableEntry>, MemtableError> {
         lock_or_error(&self.memory_metrics)?.memtable_reads += 1;
         match self.in_memory_repr.get(key) {
             None => {
                 return {
+                    // ! do not read from disk here
+                    // return MemtableError:MissingKey caller will match on this
                     lock_or_error(&self.memory_metrics)?.lsm_reads += 1;
-                    // lsm-reader should return
-                    // # of ss-tables it read
-                    // # of lsm-tree levels it traversed
-                    // self.metrics.ss_table_reads += lsm_reader()
-                    // just log out how many ss_tables this request took, caller doesnt care
                     Err(MemtableError::LsmTreeError(
                         lsm::LsmTreeError::Unimplemented(),
                     ))
@@ -471,12 +485,24 @@ impl Memtable {
     // write in memory contents out to lsm tree as Level 0
     fn flush(&mut self) -> Result<(), MemtableError> {
         let start = time::Instant::now();
-
+        println!("starting flushing to ss-table");
         /*
-
-
-
+        (Issue #10 [https://github.com/Rich-T-kid/rusty-swift-merge/issues/10])
+        Open /data directory
+        create in memory buffer/vector
+        Set up header
+        iterate through btreeMap and for each entry serialize it
+        write out vector to file
+         */
+        /*
+        clear state
+        should the metrics be reset here?
         */
+        println!("finsihed flushing to disk, reseting state");
+        self.flush_by = time::Instant::now()
+            + time::Duration::from_secs(self.config.as_ref().unwrap().ram_max_time as u64);
+        self.current_size_bytes = 0;
+        self.in_memory_repr = BTreeMap::new();
 
         lock_or_error(&self.memory_metrics)?
             .flush_duration
@@ -562,15 +588,30 @@ impl Memtable {
 
     // need to read from config to handle this
     // checks if conditions are met to flush
+    fn manage_flush(&mut self) -> Result<(), MemtableError> {
+        if self.should_flush() {
+            println!("recieved the trigger to flush content to disk !!!! ");
+            self.flush()?;
+            lock_or_error(&self.memory_metrics)?.flush_counter += 1;
+        }
+        Ok(())
+    }
     fn should_flush(&self) -> bool {
+        if self.current_size_bytes >= self.config.as_ref().unwrap().ram_max_size
+            || time::Instant::now() > self.flush_by
+        {
+            return true;
+        }
+        println!(
+            "dont need to flush, curr memory size: {} \n instant_to_flush: {:?}",
+            self.current_size_bytes, self.flush_by
+        );
         false
     }
-    // should be able to handle a file or a load of bytes (grpc call)
+    // this reloads the self.flush by counter
     pub fn update_config(&mut self, content: ConfigSource) -> Result<(), MemtableError> {
-        println!("inside update config");
         match content {
             ConfigSource::FileSource(name) => {
-                println!("1");
                 let config_as_str = fs::read_to_string(name)
                     .map_err(|_| MemtableError::InitError(MemInitError::MissingConfig()))?;
                 if config_as_str.len() == 0 {
@@ -581,7 +622,6 @@ impl Memtable {
                 self.config = Some(config);
             }
             ConfigSource::RawBytes(raw_bytes) => {
-                println!("2");
                 let config_as_str = String::from_utf8(raw_bytes).map_err(|_| {
                     MemtableError::InitError(MemInitError::InvalidFormat(
                         "Invalid UTF-8 in raw bytes".to_string(),
@@ -595,7 +635,6 @@ impl Memtable {
                 self.config = Some(config);
             }
             ConfigSource::Default() => {
-                println!("3");
                 let config = ConfigInfo {
                     ram_max_size: 20480,
                     ram_max_time: 600,
@@ -609,6 +648,8 @@ impl Memtable {
                 self.config = Some(config);
             }
         }
+        self.flush_by = time::Instant::now()
+            + time::Duration::from_secs(self.config.as_ref().unwrap().ram_max_time as u64);
         Ok(())
     }
     pub fn shutdown(&mut self) -> Result<(), MemtableError> {

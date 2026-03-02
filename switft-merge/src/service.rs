@@ -2,11 +2,13 @@ use crate::memtable::mem::{Memtable, TableEntry, TrueTypes, TypeInfoMetadata};
 use crate::service::swiftmerge::{ReadStatsResponse, WriteMetrics};
 use log::{info, warn};
 use simplelog::*;
-use std::collections::{self, BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
-use std::sync::{Arc, Mutex};
+use std::mem;
+use std::sync::{Arc, Mutex, RwLock};
 use tonic::{Request, Response, Status, transport::Server};
 
+use crate::lsm_tree::disk::LsmTreeManager;
 // import the generated rust code from proto
 pub mod swiftmerge {
     tonic::include_proto!("swiftmerge.v01");
@@ -62,13 +64,18 @@ fn validate_put_request(req: &PutRequest) -> Result<(), Status> {
 // this struct holds our database state
 pub struct MyLsmDb {
     // we wrap memtable in mutex for thread-safe access from grpc threads
-    db: Arc<Mutex<Memtable>>,
+    // lsm-tree is write heavy in nature so it make sense t
+    memtable_mutex: Arc<RwLock<Memtable>>,
+    lsm_tree: Arc<LsmTreeManager>,
 }
 
 impl MyLsmDb {
     // create a new instance of our service with a shared memtable
-    pub fn new(db: Arc<Mutex<Memtable>>) -> Self {
-        MyLsmDb { db }
+    pub fn new(mem: Arc<RwLock<Memtable>>, lsm: Arc<LsmTreeManager>) -> Self {
+        MyLsmDb {
+            memtable_mutex: mem,
+            lsm_tree: lsm,
+        }
     }
 }
 
@@ -116,8 +123,8 @@ impl Lsmdb for MyLsmDb {
 
         // lock the database and perform the write operation
         let mut db = self
-            .db
-            .lock()
+            .memtable_mutex
+            .write()
             .map_err(|_| Status::internal("lock poisoned"))?;
         db.put(&req.key, entry)
             .map_err(|e| Status::internal(format!("db error: {:?}", e)))?;
@@ -135,8 +142,8 @@ impl Lsmdb for MyLsmDb {
 
         // lock the database and write a tombstone for the key
         let mut db = self
-            .db
-            .lock()
+            .memtable_mutex
+            .write()
             .map_err(|_| Status::internal("lock poisoned"))?;
         db.delete(&req.key)
             .map_err(|e| Status::internal(format!("db error: {:?}", e)))?;
@@ -145,14 +152,15 @@ impl Lsmdb for MyLsmDb {
     }
 
     // handle get requests to retrieve data
+    // ! slight API change, if the key doesnt exist in the memtable, check disk but this will be through a disk reader not the memtable directly, this is to deal with lock contention
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let req = request.into_inner();
         info!("Get request: key: {:?}\tfilter:{:?}\n", req.key, req.filter);
 
         // lock the database for reading
         let db = self
-            .db
-            .lock()
+            .memtable_mutex
+            .read()
             .map_err(|_| Status::internal("lock poisoned"))?;
 
         // look up the key in the memtable
@@ -207,6 +215,8 @@ impl Lsmdb for MyLsmDb {
                     metadata: HashMap::new(),
                 }))
             }
+            // in the case that a missingKey error is returned, read from disk using
+            // lsmTreeManger but dont lock. since all files are immutable we never need locking
             Err(_) => {
                 // return an empty response if the key was not found
                 Ok(Response::new(GetResponse {
@@ -224,7 +234,7 @@ impl Lsmdb for MyLsmDb {
     ) -> Result<Response<WriteMetricsResponse>, Status> {
         let req = _request.into_inner();
         info!("write-metrics request recievied {:?}", req);
-        let (mem_metrics, disk_metrics) = self.db.lock().unwrap().metrics();
+        let (mem_metrics, disk_metrics) = self.memtable_mutex.read().unwrap().metrics();
 
         Ok(Response::new(WriteMetricsResponse {
             write_response: Some(WriteMetrics {
@@ -243,7 +253,7 @@ impl Lsmdb for MyLsmDb {
     ) -> Result<Response<ReadMetricsResponse>, Status> {
         let req = _request.into_inner();
         info!("read-metrics request recievied {:?}", req);
-        let (mem_metrics, _) = self.db.lock().unwrap().metrics();
+        let (mem_metrics, _) = self.memtable_mutex.read().unwrap().metrics();
 
         Ok(Response::new(ReadMetricsResponse {
             read_response: Some(ReadStatsResponse {
@@ -293,7 +303,7 @@ impl Lsmdb for MyLsmDb {
             .map(|del_req| del_req.key.clone())
             .collect();
 
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.memtable_mutex.write().unwrap();
 
         // Process all puts
         for put_request in req.puts {
@@ -332,6 +342,7 @@ impl Lsmdb for MyLsmDb {
         Ok(Response::new(GenericResponse {}))
     }
 
+    // ! for now range searches are only for memtable, in the future for range reads on disk itd be similar to get where we get the results from the lsmTreeManager
     async fn range(
         &self,
         request: Request<swiftmerge::RangeRequest>,
@@ -351,8 +362,8 @@ impl Lsmdb for MyLsmDb {
 
         // Lock the database for reading
         let db = self
-            .db
-            .lock()
+            .memtable_mutex
+            .read()
             .map_err(|_| Status::internal("lock poisoned"))?;
 
         // Perform range query
@@ -416,7 +427,7 @@ impl Lsmdb for MyLsmDb {
         _request: Request<()>,
     ) -> Result<Response<GenericResponse>, Status> {
         info!("Graceful shutdown request received");
-        match self.db.lock().unwrap().shutdown() {
+        match self.memtable_mutex.write().unwrap().shutdown() {
             Ok(()) => {}
             Err(error) => return Err(Status::internal(format!("shutdown error: {:?}", error))),
         };
@@ -438,7 +449,7 @@ impl Lsmdb for MyLsmDb {
         let req = request.into_inner();
         info!("Reload config request: {} bytes", req.json_config.len());
 
-        let mut db = self.db.lock().map_err(|e| {
+        let mut db = self.memtable_mutex.write().map_err(|e| {
             Status::internal(format!("failed to acquire lock on database: {:?}", e))
         })?;
 
@@ -468,10 +479,11 @@ pub fn init_logger() -> Result<(), Box<dyn std::error::Error>> {
 }
 // helper function to start the grpc server
 pub async fn run_server(
-    db: Arc<Mutex<Memtable>>,
+    memtable: Arc<RwLock<Memtable>>,
+    lsm_tree: Arc<LsmTreeManager>,
     addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let lsm_db = MyLsmDb::new(db);
+    let lsm_db = MyLsmDb::new(memtable, lsm_tree);
 
     info!("lsm-db grpc server listening on {}", addr);
 
