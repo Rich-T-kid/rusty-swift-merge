@@ -537,6 +537,46 @@ impl Memtable {
         Ok(found_table_entries)
     }
     // write in memory contents out to lsm tree as Level 0
+
+    /*
+     * SS-Table On-Disk Format:
+     * -------------------------
+     * 1. Header CRC (64 bytes) - SHA256 hash for integrity verification
+     * 2. Bloom Filter (1000 bytes) - Probabilistic data structure for key existence checks
+     * 3. Sparse Index Size (4 bytes, u32) - Size in bytes of the sparse index content
+     * 4. Sparse Index Content:
+     *    - For each block: key_len (u32) | key (variable) | offset (u64)
+     *    - Marks the first key of each block and its position in the data section
+     *    - **IMPORTANT**: Offsets are relative to the DATA SECTION start, NOT the file start
+     *    - To calculate absolute file position: HEADER_SIZE + BLOOM_FILTER_SIZE + SPARSE_INDEX_SIZE + offset
+     * 5. Data Section:
+     *    - Serialized key-value pairs in sorted order
+     *    - Format per entry: key_len (u32) | key | value_len (u32) | value
+     *    - Tombstones are represented as special value markers
+     *
+     * Sparse Index Logic:
+     * ------------------
+     * - The sparse index divides data into blocks (~64KB each, PAGE_PER_BLOCK * page_size)
+     * - Each block's first key is recorded with its byte offset in the sparse index
+     * - Offsets stored in the sparse index are RELATIVE to the beginning of the data section
+     * - This enables binary search to quickly locate which block contains a target key
+     * - During reads, the sparse index is loaded into memory to avoid scanning entire files
+     *
+     * Flush Process:
+     * -------------
+     * 1. Validate memtable is not empty
+     * 2. Create data directory structure (data/l1/)
+     * 3. Generate timestamped SS-table filename
+     * 4. Write header: CRC + bloom filter
+     * 5. Build sparse index by iterating through sorted BTreeMap
+     *    - Track block boundaries (target_block_size)
+     *    - Record offset (relative to data section) and first key when starting new blocks
+     * 6. Serialize sparse index with size prefix
+     * 7. Append all data entries
+     * 8. Write complete buffer to disk with fsync
+     * 9. Reset memtable state (clear memory, reset counters, update flush timer)
+     */
+    // ! dont forget to truncate the WAL after the in memory contents are flushed
     fn flush(&mut self) -> Result<(), MemtableError> {
         let start = time::Instant::now();
         println!("starting flushing to ss-table");
@@ -579,20 +619,15 @@ impl Memtable {
         let target_block_size = page_size * disk::PAGE_PER_BLOCK;
         let size = self.current_size_bytes as usize;
         let sparse_index_size = page_size / size;
-        println!("page size: {page_size}");
         println!("target block size : {target_block_size}");
         println!("memory size: {size}");
         println!("sparse idndex size: {sparse_index_size}");
         let mut ss_table_buffer: Vec<u8> = Vec::new();
         let mut sparse_index_array: Vec<(usize, &Vec<u8>)> = Vec::new(); // (offset,key)
         let mut block_bytes = 0;
-        let mut entry_count = 0;
 
         // Iterate through BTreeMap and print k-v pairs
         for (key, value_opt) in &self.in_memory_repr {
-            println!("i:{entry_count}");
-            entry_count += 1;
-
             // always write the first entry to sparse index
             if block_bytes == 0 {
                 sparse_index_array.push((ss_table_buffer.len(), key));
@@ -625,8 +660,6 @@ impl Memtable {
             // Actually write the entry to the buffer
             ss_table_buffer.write_all(&kv_buffer)?;
             block_bytes += entry_size;
-
-            println!("block bytes: {}", block_bytes);
         }
 
         println!("sparse index: {:?}", sparse_index_array);
@@ -659,6 +692,7 @@ impl Memtable {
         println!("Successfully wrote SS-table to: {:?}", filepath);
 
         println!("finsihed flushing to disk, reseting state");
+        self.wal.clear()?; // truncate WAL
         self.flush_by = time::Instant::now()
             + time::Duration::from_secs(self.config.as_ref().unwrap().ram_max_time as u64);
         self.current_size_bytes = 0;
@@ -1563,5 +1597,31 @@ mod flush_test {
         }
 
         // TODO: Add assertions and flush verification
+    }
+    #[test]
+    fn test_flush_superhero_entries() {
+        let mut memtable =
+            Memtable::new(ConfigSource::Default()).expect("failed to create memtable");
+
+        let superhero_names = vec![
+            "spider_man",
+            "iron_man",
+            "captain_america",
+            "thor",
+            "hulk",
+            "black_widow",
+            "hawkeye",
+            "doctor_strange",
+        ];
+
+        // Create 10KB entries for each superhero
+        let power_data = vec![0u8; 10_000];
+
+        for hero in superhero_names {
+            let entry = TableEntry::new(power_data.clone(), None);
+            memtable
+                .put(hero.as_bytes(), entry)
+                .expect(&format!("failed to register {} in memtable", hero));
+        }
     }
 }
