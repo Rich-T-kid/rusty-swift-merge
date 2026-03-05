@@ -1,7 +1,7 @@
 mod lsm_tree;
 mod memtable;
 mod service;
-use crate::{lsm_tree::disk::LsmTreeManager, memtable::mem, service::init_logger};
+use crate::{lsm_tree::disk::LsmTreeReader, memtable::mem, service::init_logger};
 use std::{
     env,
     sync::{Arc, Mutex, RwLock},
@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Start gRPC Server ---
     let memtable_instance = Arc::new(RwLock::new(table));
-    let lsm_tree = Arc::new(LsmTreeManager::new()?);
+    let lsm_tree = Arc::new(LsmTreeReader::new()?);
 
     let addr = "0.0.0.0:50051".parse()?;
     service::run_server(memtable_instance, lsm_tree, addr).await?;

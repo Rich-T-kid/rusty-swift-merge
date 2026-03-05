@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::available_parallelism;
 use std::{fs, time};
+use uuid::Uuid;
 
 pub const WRITE_AHEAD_LOG_FILE_NAME: &str = "Wal.tmp";
 pub const TOMB_STONE_BYTE_REPRESENTATION: u8 = 255;
@@ -510,15 +511,10 @@ impl Memtable {
         lock_or_error(&self.memory_metrics)?.memtable_reads += 1;
         match self.in_memory_repr.get(key) {
             None => {
-                return {
-                    // ! do not read from disk here
-                    // return MemtableError:MissingKey caller will match on this
-                    Err(MemtableError::Invariant(format!(
-                        "remove later and refactor"
-                    )))
-                };
-            } // ! if it doesnt exist in memory, read from disk (tbd)
-            // ! also increment memory_metrics.total_misses if it doesnt exist on disk
+                // ! also increment memory_metrics.total_misses if it doesnt exist on disk
+                // # TODO: update metrics
+                Err(MemtableError::MissingKey())
+            } // ! if it doesnt exist in memory, read from disk
             Some(value) => Ok(value),
         }
     }
@@ -599,11 +595,7 @@ impl Memtable {
         }
 
         // Create SS-table file with timestamp
-        let timestamp = time::SystemTime::now()
-            .duration_since(time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let filename = format!("ss-table-entry_{}.bin", timestamp);
+        let filename = format!("ss-table-entry_{}.bin", Uuid::new_v4());
         let filepath = l1_dir.join(filename);
 
         // ! build out the data buffer here [need to do research on on disk format]
@@ -612,7 +604,10 @@ impl Memtable {
         // header crc
         buffer.write(disk::HEADER_CRC.as_bytes())?;
         // bloom filter
-        let filter = disk::BloomGenerator::generate_filter(&self.in_memory_repr);
+        let filter = disk::BloomGenerator::generate_filter(
+            &self.in_memory_repr,
+            self.config.as_ref().unwrap().bloom_false_positive_rate,
+        );
         buffer.write(&filter)?;
         // construct sparse index
         let page_size = page_size::get();
@@ -625,6 +620,7 @@ impl Memtable {
         let mut ss_table_buffer: Vec<u8> = Vec::new();
         let mut sparse_index_array: Vec<(usize, &Vec<u8>)> = Vec::new(); // (offset,key)
         let mut block_bytes = 0;
+        let mut max_key: &Vec<u8> = &vec![];
 
         // Iterate through BTreeMap and print k-v pairs
         for (key, value_opt) in &self.in_memory_repr {
@@ -660,9 +656,18 @@ impl Memtable {
             // Actually write the entry to the buffer
             ss_table_buffer.write_all(&kv_buffer)?;
             block_bytes += entry_size;
+            max_key = &key; // at the end of the loop this contains the final/max key
         }
 
         println!("sparse index: {:?}", sparse_index_array);
+        let mut eof_meta_data_buffer = Vec::new();
+        let max_key_len = max_key.len() as u32;
+        eof_meta_data_buffer.write_all(&max_key_len.to_le_bytes())?; // write size
+        eof_meta_data_buffer.write(&max_key)?; // write the actual key
+        // get footer sie to insert after crc header
+        let footer_size = eof_meta_data_buffer.len() as u64;
+        // Insert footer size (u64) right after the 64-byte CRC header at position 64
+        buffer.splice(64..64, footer_size.to_le_bytes().iter().cloned());
 
         // write sparse index to buffer
         // format: sparse_index_size(u32)|key-len(u32)|key|offset(u64)|key-len(u32)|key|offset(u64)...
@@ -682,12 +687,22 @@ impl Memtable {
 
         // Write the actual sparse index content
         buffer.write_all(&sparse_index_buffer)?;
-        println!("pre data buffer:  {:?}", buffer);
-        buffer.write(&ss_table_buffer)?;
         // Write buffer contents to file
-        let mut file = fs::File::create(&filepath)?;
-        file.write_all(&buffer)?;
-        file.sync_all()?;
+        buffer.write(&ss_table_buffer)?;
+        // Write footer (max_key_len | max_key) at the end of the file
+        buffer.write_all(&eof_meta_data_buffer)?;
+        // ! [CRC (64 bytes)] [Footer Size (u64)] [Bloom Filter] [Sparse Index Size] [Sparse Index Content] [Data Section] [Footer: max_key_len(u32) | max_key]
+        match self.config.as_ref().unwrap().local_disk {
+            true => {
+                let mut file = fs::File::create(&filepath)?;
+                file.write_all(&buffer)?;
+                file.sync_all()?;
+            }
+            false => {
+                // crate::cloud_storage::write_s3(filename,&buffer)
+                unimplemented!()
+            }
+        }
 
         println!("Successfully wrote SS-table to: {:?}", filepath);
 

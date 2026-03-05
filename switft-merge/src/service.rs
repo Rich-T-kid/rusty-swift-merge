@@ -8,7 +8,7 @@ use std::mem;
 use std::sync::{Arc, Mutex, RwLock};
 use tonic::{Request, Response, Status, transport::Server};
 
-use crate::lsm_tree::disk::LsmTreeManager;
+use crate::lsm_tree::disk::LsmTreeReader;
 // import the generated rust code from proto
 pub mod swiftmerge {
     tonic::include_proto!("swiftmerge.v01");
@@ -66,12 +66,12 @@ pub struct MyLsmDb {
     // we wrap memtable in mutex for thread-safe access from grpc threads
     // lsm-tree is write heavy in nature so it make sense t
     memtable_mutex: Arc<RwLock<Memtable>>,
-    lsm_tree: Arc<LsmTreeManager>,
+    lsm_tree: Arc<LsmTreeReader>,
 }
 
 impl MyLsmDb {
     // create a new instance of our service with a shared memtable
-    pub fn new(mem: Arc<RwLock<Memtable>>, lsm: Arc<LsmTreeManager>) -> Self {
+    pub fn new(mem: Arc<RwLock<Memtable>>, lsm: Arc<LsmTreeReader>) -> Self {
         MyLsmDb {
             memtable_mutex: mem,
             lsm_tree: lsm,
@@ -215,14 +215,35 @@ impl Lsmdb for MyLsmDb {
                     metadata: HashMap::new(),
                 }))
             }
-            // in the case that a missingKey error is returned, read from disk using
-            // lsmTreeManger but dont lock. since all files are immutable we never need locking
             Err(_) => {
-                // return an empty response if the key was not found
-                Ok(Response::new(GetResponse {
-                    value: None,
-                    metadata: HashMap::new(),
-                }))
+                // Key not found in memtable, search on disk
+                drop(db); // Release the read lock before searching disk
+
+                let lsm_reader = &self.lsm_tree;
+                match lsm_reader.read(&req.key) {
+                    Ok(crate::lsm_tree::disk::SearchResult::Found(
+                        value,
+                        (_ss_tables, _levels),
+                    )) => {
+                        // Found on disk, return the value
+                        // Note: Disk entries don't have metadata support yet
+                        Ok(Response::new(GetResponse {
+                            value: Some(value),
+                            metadata: HashMap::new(),
+                        }))
+                    }
+                    Ok(crate::lsm_tree::disk::SearchResult::Missing((_ss_tables, _levels))) => {
+                        // Not found on disk either
+                        Ok(Response::new(GetResponse {
+                            value: None,
+                            metadata: HashMap::new(),
+                        }))
+                    }
+                    Err(e) => {
+                        // IO error occurred while reading from disk
+                        Err(Status::internal(format!("disk read error: {:?}", e)))
+                    }
+                }
             }
         }
     }
@@ -480,7 +501,7 @@ pub fn init_logger() -> Result<(), Box<dyn std::error::Error>> {
 // helper function to start the grpc server
 pub async fn run_server(
     memtable: Arc<RwLock<Memtable>>,
-    lsm_tree: Arc<LsmTreeManager>,
+    lsm_tree: Arc<LsmTreeReader>,
     addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let lsm_db = MyLsmDb::new(memtable, lsm_tree);
@@ -1680,5 +1701,164 @@ mod integration_tests {
 
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod generate_test_data {
+    use super::*;
+    use crate::*;
+    use tonic::Request;
+    use tonic::transport::Channel;
+
+    const SERVER_ADDRESS: &str = "http://127.0.0.1:50051";
+
+    #[tokio::test]
+    async fn generate_multiple_sstables() -> Result<(), Box<dyn std::error::Error>> {
+        // Import swiftmerge client
+        use super::swiftmerge::lsmdb_client::LsmdbClient;
+
+        // Connect to gRPC server
+        let channel = Channel::from_static(SERVER_ADDRESS).connect().await?;
+        let mut client = LsmdbClient::new(channel);
+
+        // Large list of keys to trigger multiple flushes
+        let test_keys = vec![
+            // Superheroes
+            "spider_man",
+            "iron_man",
+            "captain_america",
+            "thor",
+            "hulk",
+            "black_widow",
+            "hawkeye",
+            "doctor_strange",
+            "black_panther",
+            "ant_man",
+            "wasp",
+            "vision",
+            "scarlet_witch",
+            "winter_soldier",
+            "falcon",
+            "war_machine",
+            "star_lord",
+            "gamora",
+            "drax",
+            "rocket_raccoon",
+            "groot",
+            "mantis",
+            "nebula",
+            "loki",
+            "valkyrie",
+            // Villains
+            "thanos",
+            "ultron",
+            "red_skull",
+            "hela",
+            "killmonger",
+            "vulture",
+            "mysterio",
+            "green_goblin",
+            "doc_ock",
+            "venom",
+            "carnage",
+            "magneto",
+            "mystique",
+            "juggernaut",
+            "sabretooth",
+            // X-Men
+            "wolverine",
+            "cyclops",
+            "jean_grey",
+            "storm",
+            "rogue",
+            "beast",
+            "nightcrawler",
+            "colossus",
+            "kitty_pryde",
+            "iceman",
+            "angel",
+            "professor_x",
+            "gambit",
+            "jubilee",
+            "psylocke",
+            // Fantastic Four
+            "mr_fantastic",
+            "invisible_woman",
+            "human_torch",
+            "the_thing",
+            // Street Level
+            "daredevil",
+            "punisher",
+            "luke_cage",
+            "iron_fist",
+            "jessica_jones",
+            "elektra",
+            "blade",
+            "moon_knight",
+            "ghost_rider",
+            "deadpool",
+            // Cosmic
+            "silver_surfer",
+            "galactus",
+            "nova",
+            "captain_marvel",
+            "ms_marvel",
+            "adam_warlock",
+            "quasar",
+            "beta_ray_bill",
+            // More heroes to trigger multiple flushes
+            "she_hulk",
+            "hawkgirl",
+            "aquaman",
+            "flash",
+            "green_lantern",
+            "cyborg",
+            "martian_manhunter",
+            "wonder_woman",
+            "superman",
+            "batman",
+            "nightwing",
+            "robin",
+            "batgirl",
+            "supergirl",
+            "shazam",
+            "plastic_man",
+            "atom",
+            "firestorm",
+            "booster_gold",
+            "blue_beetle",
+        ];
+
+        // Create 10KB zero'd out value
+        let power_data = vec![0u8; 10_000];
+
+        println!("Starting to insert {} entries via gRPC...", test_keys.len());
+
+        for (idx, hero) in test_keys.iter().enumerate() {
+            let request = Request::new(PutRequest {
+                key: hero.as_bytes().to_vec(),
+                value: power_data.clone(),
+                metadata: std::collections::HashMap::new(),
+            });
+
+            match client.put(request).await {
+                Ok(response) => {
+                    if idx % 10 == 0 {
+                        println!("Inserted {} entries so far", idx);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to insert '{}': {}", hero, e);
+                }
+            }
+        }
+
+        println!("\n=== Test Data Generation Complete ===");
+        println!("Total keys inserted: {}", test_keys.len());
+        println!("Check data/l1/ directory for generated SS-table files");
+        println!("Server should have triggered multiple flushes based on ram_max_size config");
+
+        Ok(())
     }
 }
