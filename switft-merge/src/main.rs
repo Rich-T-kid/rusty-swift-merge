@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Start gRPC Server ---
     let memtable_instance = Arc::new(RwLock::new(table));
-    let lsm_tree = Arc::new(LsmTreeReader::new()?);
+    let lsm_tree = Arc::new(LsmTreeReader::new().await?);
 
     let addr = "0.0.0.0:50051".parse()?;
     service::run_server(memtable_instance, lsm_tree, addr).await?;
