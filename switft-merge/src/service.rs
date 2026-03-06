@@ -2,10 +2,12 @@ use crate::memtable::mem::{Memtable, TableEntry, TrueTypes, TypeInfoMetadata};
 use crate::service::swiftmerge::{ReadStatsResponse, WriteMetrics};
 use log::{info, warn};
 use simplelog::*;
+use std::cmp::min;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::mem;
 use std::sync::{Arc, Mutex, RwLock};
+use tokio::io::AsyncReadExt;
 use tonic::{Request, Response, Status, transport::Server};
 
 use crate::lsm_tree::disk::LsmTreeReader;
@@ -84,13 +86,14 @@ impl MyLsmDb {
 impl Lsmdb for MyLsmDb {
     // handle put requests to insert or update data
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<GenericResponse>, Status> {
-        info!("Put request: {:?}", request);
         let req = request.into_inner();
+        let key_display = &req.key[..min(req.key.len(), 200)];
+        let value_display = &req.value[..min(req.value.len(), 200)];
         info!(
             "Put request: key: {:?} ({})\tvalue:{:?} ({})\tmetadata:{:?}\n",
-            req.key,
+            key_display,
             req.key.len(),
-            req.value,
+            value_display,
             req.value.len(),
             req.metadata
         );
@@ -138,7 +141,8 @@ impl Lsmdb for MyLsmDb {
         request: Request<DeleteRequest>,
     ) -> Result<Response<GenericResponse>, Status> {
         let req = request.into_inner();
-        info!("Delete request: key{:?}\n", req.key);
+        let key_display = &req.key[..min(req.key.len(), 200)];
+        info!("Delete request: key{:?}\n", key_display);
 
         // lock the database and write a tombstone for the key
         let mut db = self
@@ -155,7 +159,11 @@ impl Lsmdb for MyLsmDb {
     // ! slight API change, if the key doesnt exist in the memtable, check disk but this will be through a disk reader not the memtable directly, this is to deal with lock contention
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let req = request.into_inner();
-        info!("Get request: key: {:?}\tfilter:{:?}\n", req.key, req.filter);
+        let key_display = &req.key[..min(req.key.len(), 200)];
+        info!(
+            "Get request: key: {:?}\tfilter:{:?}\n",
+            key_display, req.filter
+        );
 
         // lock the database for reading
         let db = self
@@ -227,6 +235,13 @@ impl Lsmdb for MyLsmDb {
                     )) => {
                         // Found on disk, return the value
                         // Note: Disk entries don't have metadata support yet
+                        if value.len() == 1 {
+                            // tombstone
+                            return Ok(Response::new(GetResponse {
+                                value: None,
+                                metadata: HashMap::new(),
+                            }));
+                        }
                         Ok(Response::new(GetResponse {
                             value: Some(value),
                             metadata: HashMap::new(),
@@ -255,7 +270,11 @@ impl Lsmdb for MyLsmDb {
     ) -> Result<Response<WriteMetricsResponse>, Status> {
         let req = _request.into_inner();
         info!("write-metrics request recievied {:?}", req);
-        let (mem_metrics, disk_metrics) = self.memtable_mutex.read().unwrap().metrics();
+        let (mem_metrics, disk_metrics) = self
+            .memtable_mutex
+            .read()
+            .map_err(|_| Status::internal("lock poisoned"))?
+            .metrics();
 
         Ok(Response::new(WriteMetricsResponse {
             write_response: Some(WriteMetrics {
@@ -274,7 +293,11 @@ impl Lsmdb for MyLsmDb {
     ) -> Result<Response<ReadMetricsResponse>, Status> {
         let req = _request.into_inner();
         info!("read-metrics request recievied {:?}", req);
-        let (mem_metrics, _) = self.memtable_mutex.read().unwrap().metrics();
+        let (mem_metrics, _) = self
+            .memtable_mutex
+            .read()
+            .map_err(|_| Status::internal("lock poisoned"))?
+            .metrics();
 
         Ok(Response::new(ReadMetricsResponse {
             read_response: Some(ReadStatsResponse {
@@ -369,9 +392,11 @@ impl Lsmdb for MyLsmDb {
         request: Request<swiftmerge::RangeRequest>,
     ) -> Result<Response<swiftmerge::RangeResponse>, Status> {
         let req = request.into_inner();
+        let start_key_display = &req.start_key[..min(req.start_key.len(), 200)];
+        let end_key_display = &req.end_key[..min(req.end_key.len(), 200)];
         info!(
             "Range request: start_key: {:?}, end_key: {:?}, filter: {:?}\n",
-            req.start_key, req.end_key, req.filter
+            start_key_display, end_key_display, req.filter
         );
 
         // Validate that start_key <= end_key
@@ -1714,6 +1739,7 @@ mod generate_test_data {
     const SERVER_ADDRESS: &str = "http://127.0.0.1:50051";
 
     #[tokio::test]
+    #[ignore]
     async fn generate_multiple_sstables() -> Result<(), Box<dyn std::error::Error>> {
         // Import swiftmerge client
         use super::swiftmerge::lsmdb_client::LsmdbClient;
@@ -1791,6 +1817,7 @@ mod generate_test_data {
             "daredevil",
             "punisher",
             "luke_cage",
+            /*
             "iron_fist",
             "jessica_jones",
             "elektra",
@@ -1827,7 +1854,7 @@ mod generate_test_data {
             "atom",
             "firestorm",
             "booster_gold",
-            "blue_beetle",
+            "blue_beetle",*/
         ];
 
         // Create 10KB zero'd out value

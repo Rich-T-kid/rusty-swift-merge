@@ -602,13 +602,13 @@ impl Memtable {
         // Create buffer for SS-table contents
         let mut buffer: Vec<u8> = Vec::new();
         // header crc
-        buffer.write(disk::HEADER_CRC.as_bytes())?;
+        buffer.write_all(disk::HEADER_CRC.as_bytes())?;
         // bloom filter
         let filter = disk::BloomGenerator::generate_filter(
             &self.in_memory_repr,
             self.config.as_ref().unwrap().bloom_false_positive_rate,
         );
-        buffer.write(&filter)?;
+        buffer.write_all(&filter)?;
         // construct sparse index
         let page_size = page_size::get();
         let target_block_size = page_size * disk::PAGE_PER_BLOCK;
@@ -663,7 +663,7 @@ impl Memtable {
         let mut eof_meta_data_buffer = Vec::new();
         let max_key_len = max_key.len() as u32;
         eof_meta_data_buffer.write_all(&max_key_len.to_le_bytes())?; // write size
-        eof_meta_data_buffer.write(&max_key)?; // write the actual key
+        eof_meta_data_buffer.write_all(&max_key)?; // write the actual key
         // get footer sie to insert after crc header
         let footer_size = eof_meta_data_buffer.len() as u64;
         // Insert footer size (u64) right after the 64-byte CRC header at position 64
@@ -688,7 +688,7 @@ impl Memtable {
         // Write the actual sparse index content
         buffer.write_all(&sparse_index_buffer)?;
         // Write buffer contents to file
-        buffer.write(&ss_table_buffer)?;
+        buffer.write_all(&ss_table_buffer)?;
         // Write footer (max_key_len | max_key) at the end of the file
         buffer.write_all(&eof_meta_data_buffer)?;
         // ! [CRC (64 bytes)] [Footer Size (u64)] [Bloom Filter] [Sparse Index Size] [Sparse Index Content] [Data Section] [Footer: max_key_len(u32) | max_key]

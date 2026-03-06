@@ -1,6 +1,6 @@
 {
-    "ramMaxSize": 1024,
-    "ramMaxTime": 600,
+    "ramMaxSize": 150000,
+    "ramMaxTime": 3600,
     "targetChunks": 4,
     "compactionCheckIntervalSeconds": 3600,
     "walEnabled": true,
