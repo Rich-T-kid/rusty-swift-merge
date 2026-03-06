@@ -1,4 +1,4 @@
-use crate::memtable::mem::{Memtable, TableEntry, TrueTypes, TypeInfoMetadata};
+use crate::memtable::mem::{Memtable, MemtableError, TableEntry, TrueTypes, TypeInfoMetadata};
 use crate::service::swiftmerge::{ReadStatsResponse, WriteMetrics};
 use log::{info, warn};
 use simplelog::*;
@@ -223,41 +223,52 @@ impl Lsmdb for MyLsmDb {
                     metadata: HashMap::new(),
                 }))
             }
-            Err(_) => {
-                // Key not found in memtable, search on disk
-                drop(db); // Release the read lock before searching disk
+            Err(variant) => {
+                drop(db); // Release the read lock before searching dis
+                match variant {
+                    MemtableError::MissingKey() => {
+                        // Key not found in memtable, search on disk
 
-                let lsm_reader = &self.lsm_tree;
-                match lsm_reader.read(&req.key) {
-                    Ok(crate::lsm_tree::disk::SearchResult::Found(
-                        value,
-                        (_ss_tables, _levels),
-                    )) => {
-                        // Found on disk, return the value
-                        // Note: Disk entries don't have metadata support yet
-                        if value.len() == 1 {
-                            // tombstone
-                            return Ok(Response::new(GetResponse {
-                                value: None,
-                                metadata: HashMap::new(),
-                            }));
+                        let lsm_reader = &self.lsm_tree;
+                        match lsm_reader.read(&req.key) {
+                            Ok(crate::lsm_tree::disk::SearchResult::Found(
+                                value,
+                                (_ss_tables, _levels),
+                            )) => {
+                                // Found on disk, return the value
+                                // Note: Disk entries don't have metadata support yet
+                                if value.len() == 1 {
+                                    // tombstone
+                                    return Ok(Response::new(GetResponse {
+                                        value: None,
+                                        metadata: HashMap::new(),
+                                    }));
+                                }
+                                Ok(Response::new(GetResponse {
+                                    value: Some(value),
+                                    metadata: HashMap::new(),
+                                }))
+                            }
+                            Ok(crate::lsm_tree::disk::SearchResult::Missing((
+                                _ss_tables,
+                                _levels,
+                            ))) => {
+                                // Not found on disk either
+                                Ok(Response::new(GetResponse {
+                                    value: None,
+                                    metadata: HashMap::new(),
+                                }))
+                            }
+                            Err(e) => {
+                                // IO error occurred while reading from disk
+                                Err(Status::internal(format!("disk read error: {:?}", e)))
+                            }
                         }
-                        Ok(Response::new(GetResponse {
-                            value: Some(value),
-                            metadata: HashMap::new(),
-                        }))
                     }
-                    Ok(crate::lsm_tree::disk::SearchResult::Missing((_ss_tables, _levels))) => {
-                        // Not found on disk either
-                        Ok(Response::new(GetResponse {
-                            value: None,
-                            metadata: HashMap::new(),
-                        }))
-                    }
-                    Err(e) => {
-                        // IO error occurred while reading from disk
-                        Err(Status::internal(format!("disk read error: {:?}", e)))
-                    }
+                    _ => Err(Status::internal(format!(
+                        "error fetching key {:?}",
+                        variant
+                    ))),
                 }
             }
         }
@@ -473,7 +484,12 @@ impl Lsmdb for MyLsmDb {
         _request: Request<()>,
     ) -> Result<Response<GenericResponse>, Status> {
         info!("Graceful shutdown request received");
-        match self.memtable_mutex.write().unwrap().shutdown() {
+        match self
+            .memtable_mutex
+            .write()
+            .map_err(|e| Status::internal(format!("failed to acquire lock on database: {:?}", e)))?
+            .shutdown()
+        {
             Ok(()) => {}
             Err(error) => return Err(Status::internal(format!("shutdown error: {:?}", error))),
         };

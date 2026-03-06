@@ -756,7 +756,12 @@ impl Memtable {
             let key_len = u32::from_le_bytes(
                 wal_content[curr_idx..curr_idx + LEN_SIZE]
                     .try_into()
-                    .unwrap(),
+                    .map_err(|_| {
+                        MemtableError::WriteAheadLog(WalError::InvalidStructure(format!(
+                            "failed to parse key length at offset {}",
+                            curr_idx
+                        )))
+                    })?,
             ) as usize;
             if key_len == 0 {
                 return too_small_parsing_err("key-length prefix cannot be 0");
@@ -775,7 +780,12 @@ impl Memtable {
             let val_len = u32::from_le_bytes(
                 wal_content[curr_idx..curr_idx + LEN_SIZE]
                     .try_into()
-                    .unwrap(),
+                    .map_err(|_| {
+                        MemtableError::WriteAheadLog(WalError::InvalidStructure(format!(
+                            "failed to parse value length at offset {}",
+                            curr_idx
+                        )))
+                    })?,
             ) as usize;
             // to parse the value there are two cases, tombstone and non tombstone, we will grab the value from
             // value-len like normal but we will compare the returned bytes to the constant TOMB_STONE_BYTE_REPRESENTATION
@@ -1153,7 +1163,7 @@ impl WalManager {
     // should callers pre-serialize the content they want written?
     // seperate the produces from consumers
     pub fn write_entry(&mut self, entry: &[u8]) -> Result<(), WalError> {
-        self.f.seek(std::io::SeekFrom::End(0)).unwrap();
+        self.f.seek(std::io::SeekFrom::End(0))?;
         match self.f.write(entry) {
             Ok(_) => Ok(()),
             Err(err) => Err(WalError::IoErr(err)),
@@ -1168,7 +1178,7 @@ impl WalManager {
     // ! possible improvments (read from disk to a medium sized buffer (1-5 MB) and build structs from buffer before refilling from disk, removes the risk of Out Of Memory since at most its the memtable_size + (1-5)MB )
     // consume all the contents of the WAl, this doesnt not delete the current contents of the WAL
     pub fn drain(&mut self) -> Result<Vec<u8>, WalError> {
-        self.f.seek(std::io::SeekFrom::Start(0)).unwrap();
+        self.f.seek(std::io::SeekFrom::Start(0))?;
         let mut buf: Vec<u8> = Vec::new();
         let _ = match self.f.read_to_end(&mut buf) {
             Ok(size) => size,
