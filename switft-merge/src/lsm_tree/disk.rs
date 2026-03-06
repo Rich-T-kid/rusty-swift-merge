@@ -3,9 +3,9 @@ use std::error::Error;
 use std::fmt::Display;
 use std::fs;
 use std::io;
-use std::io::Read;
-use std::io::Seek;
-use std::sync::RwLock;
+use tokio::fs as tokio_fs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::RwLock;
 
 use crate::memtable::mem::TableEntry;
 pub const HEADER_CRC: &str = "054a62a514e1d7d93b2955772fe6070d03a9d58f34a42d85918ac975488dbbe4"; // ! have this be injected as a secret
@@ -137,7 +137,7 @@ impl LsmTreeReader {
     // works within /data directory
     // read only
     //
-    pub fn new() -> Result<Self, LsmTreeError> {
+    pub async fn new() -> Result<Self, LsmTreeError> {
         let data_dir = std::path::Path::new("data");
 
         // Check if data directory exists, return empty if it doesn't (no data yet is okay)
@@ -162,7 +162,8 @@ impl LsmTreeReader {
             let mut file_map: FileMap = HashMap::new();
 
             // Read all files in this level directory
-            let entries = fs::read_dir(&level_dir).map_err(|e| LsmTreeError::IOErr(e))?;
+            let entries =
+                fs::read_dir(&level_dir).map_err(|e| LsmTreeError::InitFailure(e.to_string()))?;
 
             for entry in entries {
                 let entry = entry.map_err(|e| LsmTreeError::IOErr(e))?;
@@ -171,12 +172,14 @@ impl LsmTreeReader {
                 // Only process .bin files
                 if path.extension().and_then(|s| s.to_str()) == Some("bin") {
                     // Open file for TableReader
-                    let file = fs::File::open(&path).map_err(|e| LsmTreeError::IOErr(e))?;
+                    let file = tokio_fs::File::open(&path)
+                        .await
+                        .map_err(|e| LsmTreeError::IOErr(e))?;
 
                     let mut table_reader =
                         TableReader::new(file).map_err(|e| LsmTreeError::IOErr(e))?;
 
-                    let crc = table_reader.read_header()?;
+                    let crc = table_reader.read_header().await?;
                     if crc != HEADER_CRC.as_bytes() {
                         println!(
                             "{:?} contains an invalid crc header {:?}, skipping file",
@@ -188,6 +191,7 @@ impl LsmTreeReader {
                     // Generate index metadata
                     let metadata = table_reader
                         .generate_index()
+                        .await
                         .map_err(|e| LsmTreeError::IOErr(e))?;
 
                     // Insert with SSTableMetaData as key
@@ -212,7 +216,7 @@ impl LsmTreeReader {
        5. iterate through the list and call TableReader.Search(key)
        6. if key is found return Ok(SearchResult::Found(value_bytes,SearchMetaData{ss-tables_read: u16, levels_searched: u8}))
     */
-    pub fn read(&self, key: &[u8]) -> Result<SearchResult, LsmTreeError> {
+    pub async fn read(&self, key: &[u8]) -> Result<SearchResult, LsmTreeError> {
         let mut levels_searched = 0u8;
         let mut ss_tables_searched = 0u16;
 
@@ -238,7 +242,7 @@ impl LsmTreeReader {
                 // Check if key is within range: first_key <= key <= max_key
                 if key >= first_key && key <= max_key {
                     // TODO: Step 3 & 4 - Check bloom filter (Issue #9)
-                    let filter = table_reader.get_bloom_filter()?;
+                    let filter = table_reader.get_bloom_filter().await?;
                     if BloomGenerator::probably_exist(&filter, key) {
                         valid_tables.push((metadata, table_reader));
                     }
@@ -253,7 +257,7 @@ impl LsmTreeReader {
             for (_metadata, table_reader) in valid_tables {
                 ss_tables_searched += 1;
 
-                match table_reader.search(key) {
+                match table_reader.search(key).await {
                     Ok(Some(value)) => {
                         // Found the key
                         return Ok(SearchResult::Found(
@@ -291,19 +295,19 @@ struct SSTableMetaData {
 type TableResult<T> = Result<T, io::Error>;
 #[derive(Debug)]
 struct TableReader {
-    f: RwLock<fs::File>, // Changed: Use RwLock instead of RefCell for thread safety
+    f: RwLock<tokio_fs::File>,
     data_section_offset: Option<usize>,
     metadata_cache: Option<SSTableMetaData>,
 }
 
 impl TableReader {
-    const HEADER_SIZE: usize = 64; // 64 bytes
-    const FOOTER_SIZE_FIELD_SIZE: usize = 8; // u64 for footer size
-    const BLOOM_FILTER_SIZE: usize = BLOOM_FILTER_SIZE; // 1000 bytes
-    const BLOOM_FILTER_OFFSET: usize = Self::HEADER_SIZE + Self::FOOTER_SIZE_FIELD_SIZE; // 72
-    const SPARSE_INDEX_OFFSET: usize = Self::BLOOM_FILTER_OFFSET + Self::BLOOM_FILTER_SIZE; // 1072
+    const HEADER_SIZE: usize = 64;
+    const FOOTER_SIZE_FIELD_SIZE: usize = 8;
+    const BLOOM_FILTER_SIZE: usize = BLOOM_FILTER_SIZE;
+    const BLOOM_FILTER_OFFSET: usize = Self::HEADER_SIZE + Self::FOOTER_SIZE_FIELD_SIZE;
+    const SPARSE_INDEX_OFFSET: usize = Self::BLOOM_FILTER_OFFSET + Self::BLOOM_FILTER_SIZE;
 
-    fn new(f: fs::File) -> TableResult<Self> {
+    fn new(f: tokio_fs::File) -> TableResult<Self> {
         Ok(Self {
             f: RwLock::new(f),
             data_section_offset: None,
@@ -311,97 +315,91 @@ impl TableReader {
         })
     }
 
-    fn read_header(&mut self) -> TableResult<Vec<u8>> {
-        let mut file = self
-            .f
-            .write()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "lock poisoned"))?;
-        file.seek(io::SeekFrom::Start(0))?;
+    async fn read_header(&mut self) -> TableResult<Vec<u8>> {
+        let mut file = self.f.write().await;
+        file.seek(io::SeekFrom::Start(0)).await?;
 
         let mut buffer = [0u8; Self::HEADER_SIZE];
-        file.read_exact(&mut buffer)?;
+        file.read_exact(&mut buffer).await?;
         Ok(buffer.to_vec())
     }
 
-    fn get_bloom_filter(&self) -> TableResult<Vec<u8>> {
-        let mut file = self
-            .f
-            .write()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "lock poisoned"))?;
+    async fn get_bloom_filter(&self) -> TableResult<Vec<u8>> {
+        let mut file = self.f.write().await;
 
-        // Bloom filter starts at byte 72 (after 64-byte header + 8-byte footer size)
-        file.seek(io::SeekFrom::Start(Self::BLOOM_FILTER_OFFSET as u64))?;
+        file.seek(io::SeekFrom::Start(Self::BLOOM_FILTER_OFFSET as u64))
+            .await?;
 
         let mut buffer = vec![0u8; Self::BLOOM_FILTER_SIZE];
-        file.read_exact(&mut buffer)?;
+        file.read_exact(&mut buffer).await?;
         Ok(buffer)
     }
 
-    fn read_footer(&mut self) -> TableResult<Vec<u8>> {
-        let mut file = self
-            .f
-            .write()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "lock poisoned"))?;
+    async fn read_footer(&mut self) -> TableResult<Vec<u8>> {
+        let mut file = self.f.write().await;
 
-        // Footer size is stored at byte 64 (right after CRC header)
-        file.seek(io::SeekFrom::Start(Self::HEADER_SIZE as u64))?;
+        file.seek(io::SeekFrom::Start(Self::HEADER_SIZE as u64))
+            .await?;
         let mut footer_size_buf = [0u8; 8];
-        file.read_exact(&mut footer_size_buf)?;
+        file.read_exact(&mut footer_size_buf).await?;
         let footer_size = u64::from_le_bytes(footer_size_buf);
 
-        // Sanity check: if footer_size is unreasonably large or 0, this is likely an old format file
         if footer_size == 0 || footer_size > 10000 {
-            // Return empty key for old format files
             return Ok(Vec::new());
         }
 
         let footer_size = footer_size as i64;
 
-        // Seek to the footer at the end of the file
-        file.seek(io::SeekFrom::End(-footer_size))?;
+        file.seek(io::SeekFrom::End(-footer_size)).await?;
 
-        // Read max_key_len (u32)
         let mut key_len_buf = [0u8; 4];
-        file.read_exact(&mut key_len_buf)?;
+        file.read_exact(&mut key_len_buf).await?;
         let max_key_len = u32::from_le_bytes(key_len_buf) as usize;
 
-        // Read max_key
         let mut max_key = vec![0u8; max_key_len];
-        file.read_exact(&mut max_key)?;
+        file.read_exact(&mut max_key).await?;
 
         Ok(max_key)
     }
 
-    fn get_sparse_index(&mut self) -> TableResult<Vec<(u64, Vec<u8>)>> {
+    async fn generate_index(&mut self) -> TableResult<SSTableMetaData> {
+        // Return cached metadata if available
+        if let Some(ref cached) = self.metadata_cache {
+            return Ok(cached.clone());
+        }
+
+        // Otherwise, generate it by calling get_sparse_index
+        self.get_sparse_index().await?;
+
+        // metadata_cache should now be populated
+        Ok(self.metadata_cache.as_ref().unwrap().clone())
+    }
+
+    async fn get_sparse_index(&mut self) -> TableResult<Vec<(u64, Vec<u8>)>> {
         if let Some(ref cached) = self.metadata_cache {
             return Ok(cached.sparse_index.clone());
         }
 
-        let mut file = self
-            .f
-            .write()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "lock poisoned"))?;
+        let mut file = self.f.write().await;
 
-        // Sparse index starts at byte 1072 (after header + footer_size + bloom filter)
-        file.seek(io::SeekFrom::Start(Self::SPARSE_INDEX_OFFSET as u64))?;
+        file.seek(io::SeekFrom::Start(Self::SPARSE_INDEX_OFFSET as u64))
+            .await?;
 
         let mut size_buf = [0u8; 4];
-        file.read_exact(&mut size_buf)?;
+        file.read_exact(&mut size_buf).await?;
         let sparse_index_content_size = u32::from_le_bytes(size_buf) as usize;
 
-        // Data section starts after: sparse_index_offset + size_field(4) + sparse_index_content
         self.data_section_offset = Some(Self::SPARSE_INDEX_OFFSET + 4 + sparse_index_content_size);
 
         let mut sparse_index_buffer = vec![0u8; sparse_index_content_size];
-        file.read_exact(&mut sparse_index_buffer)?;
+        file.read_exact(&mut sparse_index_buffer).await?;
 
-        drop(file); // Release the lock
+        drop(file);
 
         let mut result = Vec::new();
         let mut pos = 0;
 
         while pos < sparse_index_buffer.len() {
-            // Read key length (4 bytes)
             if pos + 4 > sparse_index_buffer.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -414,7 +412,6 @@ impl TableReader {
                 })?) as usize;
             pos += 4;
 
-            // Read key
             if pos + key_len > sparse_index_buffer.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -427,7 +424,6 @@ impl TableReader {
             let key = sparse_index_buffer[pos..pos + key_len].to_vec();
             pos += key_len;
 
-            // Read offset (8 bytes)
             if pos + 8 > sparse_index_buffer.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -443,13 +439,9 @@ impl TableReader {
             result.push((offset, key));
         }
 
-        let max_key = self.read_footer()?;
+        let max_key = self.read_footer().await?;
 
-        let metadata = self
-            .f
-            .read()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "lock poisoned"))?
-            .metadata()?;
+        let metadata = self.f.read().await.metadata().await?;
         let created = metadata.created()?;
         let creation_timestamp = created
             .duration_since(std::time::UNIX_EPOCH)
@@ -466,7 +458,7 @@ impl TableReader {
         Ok(result)
     }
 
-    fn search(&self, key: &[u8]) -> TableResult<Option<Vec<u8>>> {
+    async fn search(&self, key: &[u8]) -> TableResult<Option<Vec<u8>>> {
         let sparse_index = self.metadata_cache.as_ref().unwrap().sparse_index.clone();
 
         let data_offset = self
@@ -483,28 +475,25 @@ impl TableReader {
         };
 
         let file_position = data_offset as u64 + search_offset;
-        let mut file = self
-            .f
-            .write()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "lock poisoned"))?;
-        file.seek(io::SeekFrom::Start(file_position))?;
+        let mut file = self.f.write().await;
+        file.seek(io::SeekFrom::Start(file_position)).await?;
 
         loop {
             let mut key_len_buf = [0u8; 4];
-            if file.read_exact(&mut key_len_buf).is_err() {
+            if file.read_exact(&mut key_len_buf).await.is_err() {
                 return Ok(None);
             }
             let entry_key_len = u32::from_le_bytes(key_len_buf) as usize;
 
             let mut entry_key = vec![0u8; entry_key_len];
-            file.read_exact(&mut entry_key)?;
+            file.read_exact(&mut entry_key).await?;
 
             let mut value_len_buf = [0u8; 4];
-            file.read_exact(&mut value_len_buf)?;
+            file.read_exact(&mut value_len_buf).await?;
             let value_len = u32::from_le_bytes(value_len_buf) as usize;
 
             let mut value = vec![0u8; value_len];
-            file.read_exact(&mut value)?;
+            file.read_exact(&mut value).await?;
 
             match entry_key.as_slice().cmp(key) {
                 std::cmp::Ordering::Equal => return Ok(Some(value)),
@@ -512,19 +501,6 @@ impl TableReader {
                 std::cmp::Ordering::Less => continue,
             }
         }
-    }
-
-    fn generate_index(&mut self) -> TableResult<SSTableMetaData> {
-        // Return cached metadata if available
-        if let Some(ref cached) = self.metadata_cache {
-            return Ok(cached.clone());
-        }
-
-        // Otherwise, generate it by calling get_sparse_index
-        self.get_sparse_index()?;
-
-        // metadata_cache should now be populated
-        Ok(self.metadata_cache.as_ref().unwrap().clone())
     }
 }
 
@@ -554,19 +530,19 @@ mod table_reader_test {
     const DIRECTORY: &str = "src/lsm_tree";
     const TEST_FILE: &str = "tb1.bin";
 
-    #[test]
-    fn test_read_header() {
+    #[tokio::test]
+    async fn test_read_header() {
         let dir_path = std::path::Path::new(DIRECTORY).join(TEST_FILE);
-        let mut reader = TableReader::new(fs::File::open(dir_path).unwrap()).unwrap();
-        let header = reader.read_header().unwrap();
+        let mut reader = TableReader::new(tokio_fs::File::open(dir_path).await.unwrap()).unwrap();
+        let header = reader.read_header().await.unwrap();
         assert_eq!(header, HEADER_CRC.as_bytes())
     }
 
-    #[test]
-    fn test_get_bloom_filter() {
+    #[tokio::test]
+    async fn test_get_bloom_filter() {
         let dir_path = std::path::Path::new(DIRECTORY).join(TEST_FILE);
-        let mut reader = TableReader::new(fs::File::open(dir_path).unwrap()).unwrap();
-        let bloom_filter = reader.get_bloom_filter().unwrap();
+        let reader = TableReader::new(tokio_fs::File::open(dir_path).await.unwrap()).unwrap();
+        let bloom_filter = reader.get_bloom_filter().await.unwrap();
 
         // Assert correct length
         assert_eq!(bloom_filter.len(), BLOOM_FILTER_SIZE);
@@ -578,27 +554,28 @@ mod table_reader_test {
         );
     }
 
-    #[test]
-    fn test_get_sparse_index() {
+    #[tokio::test]
+    async fn test_get_sparse_index() {
         let dir_path = std::path::Path::new(DIRECTORY).join(TEST_FILE);
-        let mut reader = TableReader::new(fs::File::open(dir_path).unwrap()).unwrap();
-        let sparse_index = reader.get_sparse_index().unwrap();
+        let mut reader = TableReader::new(tokio_fs::File::open(dir_path).await.unwrap()).unwrap();
+        let sparse_index = reader.get_sparse_index().await.unwrap();
         println!("sparse index : {:?} ", sparse_index);
         assert!(sparse_index.len() >= 1);
         // Expected sparse index based on superhero test
     }
 
-    #[test]
-    fn test_search_existing_key() {
+    #[tokio::test]
+    async fn test_search_existing_key() {
         let dir_path = std::path::Path::new(DIRECTORY).join(TEST_FILE);
-        let mut reader = TableReader::new(fs::File::open(dir_path).unwrap()).unwrap();
+        let mut reader = TableReader::new(tokio_fs::File::open(dir_path).await.unwrap()).unwrap();
 
         // Search for a key that exists - "hulk"
         reader
             .generate_index()
+            .await
             .map_err(|_| format!("failed to generate index"))
             .unwrap();
-        let result = reader.search(b"hulk").unwrap();
+        let result = reader.search(b"hulk").await.unwrap();
         assert!(result.is_some(), "Expected to find 'hulk' in SS-table");
 
         // Verify the value is the correct size (10KB entry serialized)
@@ -608,13 +585,14 @@ mod table_reader_test {
         println!("Successfully found 'hulk' with value size: {}", value.len());
     }
 
-    #[test]
-    fn test_search_nonexistent_key_before_range() {
+    #[tokio::test]
+    async fn test_search_nonexistent_key_before_range() {
         let dir_path = std::path::Path::new(DIRECTORY).join(TEST_FILE);
-        let mut reader = TableReader::new(fs::File::open(dir_path).unwrap()).unwrap();
+        let mut reader = TableReader::new(tokio_fs::File::open(dir_path).await.unwrap()).unwrap();
 
+        reader.generate_index().await.unwrap();
         // Search for a key that comes before all superhero names alphabetically
-        let result = reader.search(b"aardvark").unwrap();
+        let result = reader.search(b"aardvark").await.unwrap();
 
         assert!(
             result.is_none(),
@@ -623,13 +601,14 @@ mod table_reader_test {
         println!("Correctly returned None for non-existent key before range");
     }
 
-    #[test]
-    fn test_search_nonexistent_key_in_range() {
+    #[tokio::test]
+    async fn test_search_nonexistent_key_in_range() {
         let dir_path = std::path::Path::new(DIRECTORY).join(TEST_FILE);
-        let mut reader = TableReader::new(fs::File::open(dir_path).unwrap()).unwrap();
+        let mut reader = TableReader::new(tokio_fs::File::open(dir_path).await.unwrap()).unwrap();
 
+        reader.generate_index().await.unwrap();
         // Search for a key between existing keys - "green_lantern" falls between "doctor_strange" and "hawkeye"
-        let result = reader.search(b"green_lantern").unwrap();
+        let result = reader.search(b"green_lantern").await.unwrap();
 
         assert!(
             result.is_none(),
@@ -638,13 +617,14 @@ mod table_reader_test {
         println!("Correctly returned None for non-existent key within range");
     }
 
-    #[test]
-    fn test_search_nonexistent_key_after_range() {
+    #[tokio::test]
+    async fn test_search_nonexistent_key_after_range() {
         let dir_path = std::path::Path::new(DIRECTORY).join(TEST_FILE);
-        let mut reader = TableReader::new(fs::File::open(dir_path).unwrap()).unwrap();
+        let mut reader = TableReader::new(tokio_fs::File::open(dir_path).await.unwrap()).unwrap();
 
+        reader.generate_index().await.unwrap();
         // Search for a key that comes after all superhero names alphabetically
-        let result = reader.search(b"wonder_woman").unwrap();
+        let result = reader.search(b"wonder_woman").await.unwrap();
 
         assert!(
             result.is_none(),
@@ -659,63 +639,63 @@ mod lsm_reader_test {
 
     use super::*;
 
-    #[test]
-    fn test_new() {
-        let r = LsmTreeReader::new().unwrap();
+    #[tokio::test]
+    async fn test_new() {
+        let r = LsmTreeReader::new().await.unwrap();
         println!("{}", r);
         let size = r.level_array.len();
         println!("size: {size}")
     }
 
-    #[test]
-    fn test_read_existing_keys() {
-        let mut reader = LsmTreeReader::new().unwrap();
+    #[tokio::test]
+    async fn test_read_existing_keys() {
+        let reader = LsmTreeReader::new().await.unwrap();
 
         let test_keys = vec!["spider_man", "iron_man", "captain_america"];
 
         for key in test_keys {
             println!("\n=== Searching for existing key: '{}' ===", key);
-            match reader.read(key.as_bytes()) {
+            match reader.read(key.as_bytes()).await {
                 Ok(SearchResult::Found(value, (ss_tables, levels))) => {
-                    println!("  Found key '{}'", key);
+                    println!("Found key '{}'", key);
                     println!("  Value size: {} bytes", value.len());
                     println!("  SS-tables searched: {}", ss_tables);
                     println!("  Levels searched: {}", levels);
                 }
                 Ok(SearchResult::Missing((ss_tables, levels))) => {
-                    println!(" Key '{}' not found (unexpected!)", key);
+                    println!("Key '{}' not found (unexpected!)", key);
                     println!("  SS-tables searched: {}", ss_tables);
                     println!("  Levels searched: {}", levels);
                 }
                 Err(e) => {
-                    println!("✗ Error searching for '{}': {}", key, e);
+                    println!("Error searching for '{}': {}", key, e);
                 }
             }
         }
     }
 
-    #[test]
-    fn test_read_nonexistent_keys() {
-        let mut reader = LsmTreeReader::new().unwrap();
+    #[tokio::test]
+    async fn test_read_nonexistent_keys() {
+        let reader = LsmTreeReader::new().await.unwrap();
 
         let test_keys = vec!["spider_man1", "iron_man1", "captain_america1"];
 
         for key in test_keys {
             println!("\n=== Searching for non-existent key: '{}' ===", key);
-            match reader.read(key.as_bytes()) {
+            match reader.read(key.as_bytes()).await {
                 Ok(SearchResult::Found(value, (ss_tables, levels))) => {
-                    println!(" Found key '{}' (unexpected!)", key);
+                    println!("Found key '{}' (unexpected!)", key);
                     println!("  Value size: {} bytes", value.len());
                     println!("  SS-tables searched: {}", ss_tables);
                     println!("  Levels searched: {}", levels);
                 }
                 Ok(SearchResult::Missing((ss_tables, levels))) => {
-                    println!(" Key '{}' not found (expected)", key);
+                    println!("Key '{}' not found (expected)", key);
                     println!("  SS-tables searched: {}", ss_tables);
                     println!("  Levels searched: {}", levels);
                 }
                 Err(e) => {
-                    println!(" Error searching for '{}': {}", key, e);
+                    println!("Error searching for '{}': {}", key, e);
                 }
             }
         }

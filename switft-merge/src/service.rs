@@ -165,20 +165,23 @@ impl Lsmdb for MyLsmDb {
             key_display, req.filter
         );
 
-        // lock the database for reading
-        let db = self
-            .memtable_mutex
-            .read()
-            .map_err(|_| Status::internal("lock poisoned"))?;
+        // First, try to get from memtable in its own scope
+        let memtable_result = {
+            let db = self
+                .memtable_mutex
+                .read()
+                .map_err(|_| Status::internal("lock poisoned"))?;
 
-        // look up the key in the memtable
-        match db.get(&req.key) {
+            db.get(&req.key).map(|opt| opt.as_ref().cloned())
+        }; // Lock is dropped here
+
+        // Now handle the result without holding the lock
+        match memtable_result {
             Ok(Some(entry)) => {
                 // map internal metadata back to grpc typeinfo for the client
                 let mut grpc_metadata = BTreeMap::new();
                 if let Some(md) = &entry.meta_data {
                     for (key, meta) in md {
-                        // convert our internal rust enum back to the proto enum
                         let grpc_type = match meta.true_type {
                             TrueTypes::Bool => SupportedMetadataTypes::Bool,
                             TrueTypes::RawBytes => SupportedMetadataTypes::RawByte,
@@ -205,38 +208,32 @@ impl Lsmdb for MyLsmDb {
                 // apply metadata filtering if requested by the client
                 if let Some(filter) = req.filter {
                     if filter.r#use {
-                        // keep only the keys specified in the filter
                         grpc_metadata.retain(|k, _| filter.metadata_keys.contains(k));
                     }
                 }
 
-                // return the value and metadata
                 Ok(Response::new(GetResponse {
                     value: Some(entry.value.clone()),
                     metadata: grpc_metadata.into_iter().collect(),
                 }))
             }
             Ok(None) => {
-                // return an empty response if the key was deleted (tombstone)
+                // Tombstone
                 Ok(Response::new(GetResponse {
                     value: None,
                     metadata: HashMap::new(),
                 }))
             }
             Err(variant) => {
-                drop(db); // Release the read lock before searching dis
+                // Key not found in memtable, search on disk
                 match variant {
                     MemtableError::MissingKey() => {
-                        // Key not found in memtable, search on disk
-
-                        let lsm_reader = &self.lsm_tree;
-                        match lsm_reader.read(&req.key) {
+                        // Now safe to await since lock is already dropped
+                        match self.lsm_tree.read(&req.key).await {
                             Ok(crate::lsm_tree::disk::SearchResult::Found(
                                 value,
                                 (_ss_tables, _levels),
                             )) => {
-                                // Found on disk, return the value
-                                // Note: Disk entries don't have metadata support yet
                                 if value.len() == 1 {
                                     // tombstone
                                     return Ok(Response::new(GetResponse {
@@ -252,17 +249,11 @@ impl Lsmdb for MyLsmDb {
                             Ok(crate::lsm_tree::disk::SearchResult::Missing((
                                 _ss_tables,
                                 _levels,
-                            ))) => {
-                                // Not found on disk either
-                                Ok(Response::new(GetResponse {
-                                    value: None,
-                                    metadata: HashMap::new(),
-                                }))
-                            }
-                            Err(e) => {
-                                // IO error occurred while reading from disk
-                                Err(Status::internal(format!("disk read error: {:?}", e)))
-                            }
+                            ))) => Ok(Response::new(GetResponse {
+                                value: None,
+                                metadata: HashMap::new(),
+                            })),
+                            Err(e) => Err(Status::internal(format!("disk read error: {:?}", e))),
                         }
                     }
                     _ => Err(Status::internal(format!(
