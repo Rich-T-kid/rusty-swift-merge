@@ -1,11 +1,16 @@
-use crate::memtable::mem::{Memtable, TableEntry, TrueTypes, TypeInfoMetadata};
+use crate::memtable::mem::{Memtable, MemtableError, TableEntry, TrueTypes, TypeInfoMetadata};
+use crate::service::swiftmerge::{ReadStatsResponse, WriteMetrics};
 use log::{info, warn};
 use simplelog::*;
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::min;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
-use std::sync::{Arc, Mutex};
+use std::mem;
+use std::sync::{Arc, Mutex, RwLock};
+use tokio::io::AsyncReadExt;
 use tonic::{Request, Response, Status, transport::Server};
 
+use crate::lsm_tree::disk::LsmTreeReader;
 // import the generated rust code from proto
 pub mod swiftmerge {
     tonic::include_proto!("swiftmerge.v01");
@@ -14,8 +19,8 @@ pub mod swiftmerge {
 // pull in the server trait and message types from the generated code
 use swiftmerge::lsmdb_server::{Lsmdb, LsmdbServer};
 pub use swiftmerge::{
-    DeleteRequest, GenericResponse, GetRequest, GetResponse, PutRequest, ReadMetricsRequest,
-    ReadMetricsResponse, SupportedMetadataTypes, TypeInfo, WriteMetricsRequest,
+    DeleteRequest, GenericResponse, GetRequest, GetResponse, HealthCheckResponse, PutRequest,
+    ReadMetricsRequest, ReadMetricsResponse, SupportedMetadataTypes, TypeInfo, WriteMetricsRequest,
     WriteMetricsResponse,
 };
 
@@ -61,13 +66,18 @@ fn validate_put_request(req: &PutRequest) -> Result<(), Status> {
 // this struct holds our database state
 pub struct MyLsmDb {
     // we wrap memtable in mutex for thread-safe access from grpc threads
-    db: Arc<Mutex<Memtable>>,
+    // lsm-tree is write heavy in nature so it make sense t
+    memtable_mutex: Arc<RwLock<Memtable>>,
+    lsm_tree: Arc<LsmTreeReader>,
 }
 
 impl MyLsmDb {
     // create a new instance of our service with a shared memtable
-    pub fn new(db: Arc<Mutex<Memtable>>) -> Self {
-        MyLsmDb { db }
+    pub fn new(mem: Arc<RwLock<Memtable>>, lsm: Arc<LsmTreeReader>) -> Self {
+        MyLsmDb {
+            memtable_mutex: mem,
+            lsm_tree: lsm,
+        }
     }
 }
 
@@ -76,13 +86,14 @@ impl MyLsmDb {
 impl Lsmdb for MyLsmDb {
     // handle put requests to insert or update data
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<GenericResponse>, Status> {
-        info!("Put request: {:?}", request);
         let req = request.into_inner();
+        let key_display = &req.key[..min(req.key.len(), 200)];
+        let value_display = &req.value[..min(req.value.len(), 200)];
         info!(
             "Put request: key: {:?} ({})\tvalue:{:?} ({})\tmetadata:{:?}\n",
-            req.key,
+            key_display,
             req.key.len(),
-            req.value,
+            value_display,
             req.value.len(),
             req.metadata
         );
@@ -115,8 +126,8 @@ impl Lsmdb for MyLsmDb {
 
         // lock the database and perform the write operation
         let mut db = self
-            .db
-            .lock()
+            .memtable_mutex
+            .write()
             .map_err(|_| Status::internal("lock poisoned"))?;
         db.put(&req.key, entry)
             .map_err(|e| Status::internal(format!("db error: {:?}", e)))?;
@@ -130,12 +141,13 @@ impl Lsmdb for MyLsmDb {
         request: Request<DeleteRequest>,
     ) -> Result<Response<GenericResponse>, Status> {
         let req = request.into_inner();
-        info!("Delete request: key{:?}\n", req.key);
+        let key_display = &req.key[..min(req.key.len(), 200)];
+        info!("Delete request: key{:?}\n", key_display);
 
         // lock the database and write a tombstone for the key
         let mut db = self
-            .db
-            .lock()
+            .memtable_mutex
+            .write()
             .map_err(|_| Status::internal("lock poisoned"))?;
         db.delete(&req.key)
             .map_err(|e| Status::internal(format!("db error: {:?}", e)))?;
@@ -144,14 +156,19 @@ impl Lsmdb for MyLsmDb {
     }
 
     // handle get requests to retrieve data
+    // ! slight API change, if the key doesnt exist in the memtable, check disk but this will be through a disk reader not the memtable directly, this is to deal with lock contention
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let req = request.into_inner();
-        info!("Get request: key: {:?}\tfilter:{:?}\n", req.key, req.filter);
+        let key_display = &req.key[..min(req.key.len(), 200)];
+        info!(
+            "Get request: key: {:?}\tfilter:{:?}\n",
+            key_display, req.filter
+        );
 
         // lock the database for reading
         let db = self
-            .db
-            .lock()
+            .memtable_mutex
+            .read()
             .map_err(|_| Status::internal("lock poisoned"))?;
 
         // look up the key in the memtable
@@ -206,12 +223,53 @@ impl Lsmdb for MyLsmDb {
                     metadata: HashMap::new(),
                 }))
             }
-            Err(_) => {
-                // return an empty response if the key was not found
-                Ok(Response::new(GetResponse {
-                    value: None,
-                    metadata: HashMap::new(),
-                }))
+            Err(variant) => {
+                drop(db); // Release the read lock before searching dis
+                match variant {
+                    MemtableError::MissingKey() => {
+                        // Key not found in memtable, search on disk
+
+                        let lsm_reader = &self.lsm_tree;
+                        match lsm_reader.read(&req.key) {
+                            Ok(crate::lsm_tree::disk::SearchResult::Found(
+                                value,
+                                (_ss_tables, _levels),
+                            )) => {
+                                // Found on disk, return the value
+                                // Note: Disk entries don't have metadata support yet
+                                if value.len() == 1 {
+                                    // tombstone
+                                    return Ok(Response::new(GetResponse {
+                                        value: None,
+                                        metadata: HashMap::new(),
+                                    }));
+                                }
+                                Ok(Response::new(GetResponse {
+                                    value: Some(value),
+                                    metadata: HashMap::new(),
+                                }))
+                            }
+                            Ok(crate::lsm_tree::disk::SearchResult::Missing((
+                                _ss_tables,
+                                _levels,
+                            ))) => {
+                                // Not found on disk either
+                                Ok(Response::new(GetResponse {
+                                    value: None,
+                                    metadata: HashMap::new(),
+                                }))
+                            }
+                            Err(e) => {
+                                // IO error occurred while reading from disk
+                                Err(Status::internal(format!("disk read error: {:?}", e)))
+                            }
+                        }
+                    }
+                    _ => Err(Status::internal(format!(
+                        "error fetching key {:?}",
+                        variant
+                    ))),
+                }
             }
         }
     }
@@ -221,9 +279,22 @@ impl Lsmdb for MyLsmDb {
         &self,
         _request: Request<WriteMetricsRequest>,
     ) -> Result<Response<WriteMetricsResponse>, Status> {
-        Err(Status::unimplemented(
-            "metrics not yet implemented in backend",
-        ))
+        let req = _request.into_inner();
+        info!("write-metrics request recievied {:?}", req);
+        let (mem_metrics, disk_metrics) = self
+            .memtable_mutex
+            .read()
+            .map_err(|_| Status::internal("lock poisoned"))?
+            .metrics();
+
+        Ok(Response::new(WriteMetricsResponse {
+            write_response: Some(WriteMetrics {
+                total_writes: mem_metrics.memtable_writes,
+                ss_table_count: disk_metrics.ss_table_count,
+                ss_table_merged: disk_metrics.total_ss_tables_merged,
+            }),
+            avg_response: None,
+        }))
     }
 
     // metrics are not yet tracked by the backend storage
@@ -231,9 +302,225 @@ impl Lsmdb for MyLsmDb {
         &self,
         _request: Request<ReadMetricsRequest>,
     ) -> Result<Response<ReadMetricsResponse>, Status> {
-        Err(Status::unimplemented(
-            "metrics not yet implemented in backend",
+        let req = _request.into_inner();
+        info!("read-metrics request recievied {:?}", req);
+        let (mem_metrics, _) = self
+            .memtable_mutex
+            .read()
+            .map_err(|_| Status::internal("lock poisoned"))?
+            .metrics();
+
+        Ok(Response::new(ReadMetricsResponse {
+            read_response: Some(ReadStatsResponse {
+                memtable_reads: mem_metrics.memtable_reads,
+                lsm_tree_reads: mem_metrics.lsm_reads,
+                total_misses: mem_metrics.total_misses,
+            }),
+            avg_response: None,
+        }))
+    }
+
+    async fn health_check(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<HealthCheckResponse>, Status> {
+        use prost_types::Timestamp;
+        use std::time::SystemTime;
+
+        info!("Health check request received");
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| Status::internal(format!("time error: {}", e)))?;
+
+        Ok(Response::new(HealthCheckResponse {
+            time_stamp: Some(Timestamp {
+                seconds: now.as_secs() as i64,
+                nanos: now.subsec_nanos() as i32,
+            }),
+        }))
+    }
+    async fn batch_write(
+        &self,
+        _request: Request<swiftmerge::BatchWriteRequest>,
+    ) -> Result<Response<GenericResponse>, Status> {
+        let req = _request.into_inner();
+        info!(
+            "Batch write request: {} puts, {} deletes",
+            req.puts.len(),
+            req.deletes.len()
+        );
+
+        // Collect all delete keys into a mutable HashSet
+        let mut delete_keys: HashSet<Vec<u8>> = req
+            .deletes
+            .iter()
+            .map(|del_req| del_req.key.clone())
+            .collect();
+
+        let mut db = self.memtable_mutex.write().unwrap();
+
+        // Process all puts
+        for put_request in req.puts {
+            // Convert metadata from proto TypeInfo to internal TypeInfoMetadata
+            let mut internal_metadata = BTreeMap::new();
+            for (key, meta) in put_request.metadata {
+                let true_type = match SupportedMetadataTypes::try_from(meta.true_type) {
+                    Ok(SupportedMetadataTypes::Bool) => TrueTypes::Bool,
+                    Ok(SupportedMetadataTypes::RawByte) => TrueTypes::RawBytes,
+                    Ok(SupportedMetadataTypes::String) => TrueTypes::String,
+                    Ok(SupportedMetadataTypes::Uint32) => TrueTypes::Uint32,
+                    Ok(SupportedMetadataTypes::Uint64) => TrueTypes::Uint64,
+                    Ok(SupportedMetadataTypes::Int32) => TrueTypes::Int32,
+                    Ok(SupportedMetadataTypes::Int64) => TrueTypes::Int64,
+                    Ok(SupportedMetadataTypes::Float32) => TrueTypes::Float32,
+                    Ok(SupportedMetadataTypes::Double) => TrueTypes::Double,
+                    _ => TrueTypes::Unspecified,
+                };
+                internal_metadata.insert(key, TypeInfoMetadata::new(meta.raw, true_type));
+            }
+
+            let entry = TableEntry::new(put_request.value, Some(internal_metadata));
+            db.put(&put_request.key, entry)
+                .map_err(|e| Status::internal(format!("db error: {:?}", e)))?;
+
+            // Remove from delete set if it was scheduled for deletion (put takes precedence)
+            delete_keys.remove(&put_request.key);
+        }
+
+        // Process remaining deletes
+        for delete_key in delete_keys {
+            db.delete(&delete_key)
+                .map_err(|e| Status::internal(format!("db error: {:?}", e)))?;
+        }
+
+        Ok(Response::new(GenericResponse {}))
+    }
+
+    // ! for now range searches are only for memtable, in the future for range reads on disk itd be similar to get where we get the results from the lsmTreeManager
+    async fn range(
+        &self,
+        request: Request<swiftmerge::RangeRequest>,
+    ) -> Result<Response<swiftmerge::RangeResponse>, Status> {
+        let req = request.into_inner();
+        let start_key_display = &req.start_key[..min(req.start_key.len(), 200)];
+        let end_key_display = &req.end_key[..min(req.end_key.len(), 200)];
+        info!(
+            "Range request: start_key: {:?}, end_key: {:?}, filter: {:?}\n",
+            start_key_display, end_key_display, req.filter
+        );
+
+        // Validate that start_key <= end_key
+        if req.start_key > req.end_key {
+            return Err(Status::invalid_argument(
+                "start_key must be less than or equal to end_key",
+            ));
+        }
+
+        // Lock the database for reading
+        let db = self
+            .memtable_mutex
+            .read()
+            .map_err(|_| Status::internal("lock poisoned"))?;
+
+        // Perform range query
+        let range_results = db
+            .range(&req.start_key, &req.end_key)
+            .map_err(|e| Status::internal(format!("range query error: {:?}", e)))?;
+
+        // Convert results to RangeResponse
+        let mut results = Vec::new();
+
+        for (key, entry_opt) in range_results.iter() {
+            // Skip tombstones (None entries)
+            if entry_opt.is_none() {
+                continue;
+            }
+
+            if let Some(entry) = entry_opt {
+                // Map internal metadata to gRPC TypeInfo
+                let mut grpc_metadata = BTreeMap::new();
+                if let Some(md) = &entry.meta_data {
+                    for (key, meta) in md {
+                        let grpc_type = match meta.true_type {
+                            TrueTypes::Bool => SupportedMetadataTypes::Bool,
+                            TrueTypes::RawBytes => SupportedMetadataTypes::RawByte,
+                            TrueTypes::String => SupportedMetadataTypes::String,
+                            TrueTypes::Uint32 => SupportedMetadataTypes::Uint32,
+                            TrueTypes::Uint64 => SupportedMetadataTypes::Uint64,
+                            TrueTypes::Int32 => SupportedMetadataTypes::Int32,
+                            TrueTypes::Int64 => SupportedMetadataTypes::Int64,
+                            TrueTypes::Float32 => SupportedMetadataTypes::Float32,
+                            TrueTypes::Double => SupportedMetadataTypes::Double,
+                            _ => SupportedMetadataTypes::Unspecified,
+                        };
+
+                        grpc_metadata.insert(
+                            key.clone(),
+                            TypeInfo {
+                                raw: meta.raw.clone(),
+                                true_type: grpc_type as i32,
+                            },
+                        );
+                    }
+                }
+
+                // Apply metadata filtering if requested
+                // ! tbd
+
+                results.push(swiftmerge::range_response::KeyValuePair {
+                    key: (*key).clone(),
+                    value: entry.value.clone(),
+                    metadata: grpc_metadata.into_iter().collect(),
+                });
+            }
+        }
+
+        Ok(Response::new(swiftmerge::RangeResponse { results }))
+    }
+
+    async fn graceful_shutdown(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<GenericResponse>, Status> {
+        info!("Graceful shutdown request received");
+        match self
+            .memtable_mutex
+            .write()
+            .map_err(|e| Status::internal(format!("failed to acquire lock on database: {:?}", e)))?
+            .shutdown()
+        {
+            Ok(()) => {}
+            Err(error) => return Err(Status::internal(format!("shutdown error: {:?}", error))),
+        };
+
+        let response = Ok(Response::new(GenericResponse {}));
+
+        // Spawn a task to exit after giving time for the response to be sent
+        tokio::spawn(async {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            std::process::exit(0);
+        });
+
+        response
+    }
+    async fn reload_config(
+        &self,
+        request: Request<swiftmerge::ReloadConfigRequest>,
+    ) -> Result<Response<GenericResponse>, Status> {
+        let req = request.into_inner();
+        info!("Reload config request: {} bytes", req.json_config.len());
+
+        let mut db = self.memtable_mutex.write().map_err(|e| {
+            Status::internal(format!("failed to acquire lock on database: {:?}", e))
+        })?;
+
+        db.update_config(crate::memtable::mem::ConfigSource::RawBytes(
+            req.json_config,
         ))
+        .map_err(|e| Status::internal(format!("failed to update config: {:?}", e)))?;
+
+        Ok(Response::new(GenericResponse {}))
     }
 }
 pub fn init_logger() -> Result<(), Box<dyn std::error::Error>> {
@@ -254,10 +541,11 @@ pub fn init_logger() -> Result<(), Box<dyn std::error::Error>> {
 }
 // helper function to start the grpc server
 pub async fn run_server(
-    db: Arc<Mutex<Memtable>>,
+    memtable: Arc<RwLock<Memtable>>,
+    lsm_tree: Arc<LsmTreeReader>,
     addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let lsm_db = MyLsmDb::new(db);
+    let lsm_db = MyLsmDb::new(memtable, lsm_tree);
 
     info!("lsm-db grpc server listening on {}", addr);
 
@@ -282,7 +570,8 @@ mod integration_tests {
     use swiftmerge::lsmdb_client::LsmdbClient;
     use swiftmerge::{DeleteRequest, GetRequest, PutRequest};
 
-    const SERVER_ADDRESS: &str = "http://104.236.210.9:50051";
+    //const SERVER_ADDRESS: &str = "http://104.236.210.9:50051";
+    const SERVER_ADDRESS: &str = "http://localhost:50051";
 
     #[tokio::test]
     async fn test_grpc_connection() -> Result<(), Box<dyn std::error::Error>> {
@@ -1257,5 +1546,362 @@ mod integration_tests {
     }
     mod in_memory_stress_test {
         // tbd later
+    }
+
+    mod additional_rpc_tests {
+        use super::swiftmerge::lsmdb_client::LsmdbClient;
+        use super::swiftmerge::{
+            BatchWriteRequest, DeleteRequest, PutRequest, RangeRequest, ReloadConfigRequest,
+        };
+        use super::{Channel, SERVER_ADDRESS};
+
+        // Test health_check RPC
+        #[tokio::test]
+        async fn test_health_check() -> Result<(), Box<dyn std::error::Error>> {
+            let channel = Channel::from_static(SERVER_ADDRESS).connect().await?;
+            let mut client = LsmdbClient::new(channel);
+
+            // Call health_check
+            let response = client.health_check(()).await?;
+            let health_response = response.into_inner();
+
+            println!("Health check response: {:?}", health_response);
+
+            // Verify that we got a timestamp
+            assert!(health_response.time_stamp.is_some());
+            let timestamp = health_response.time_stamp.unwrap();
+            assert!(timestamp.seconds > 0);
+
+            Ok(())
+        }
+
+        // Test reload_config RPC
+        #[tokio::test]
+        async fn test_reload_config() -> Result<(), Box<dyn std::error::Error>> {
+            let channel = Channel::from_static(SERVER_ADDRESS).connect().await?;
+            let mut client = LsmdbClient::new(channel);
+
+            // Create a valid JSON config
+            let config_json = r#"{
+                "wal_file_path": "./test_wal.log",
+                "max_memtable_size_bytes": 1048576,
+                "disk_tree_file_path": "./test_tree.db",
+                "ramMaxSize": 20480,
+                "ramMaxTime": 600,
+                "targetChunks": 4,
+                "compactionCheckIntervalSeconds": 3600,
+                "walEnabled": true,
+                "bloomFalsePositiveRate": 0.05,
+                "maxCompactionThreads": 2,
+                "localDisk": true
+            }"#;
+
+            let reload_request = ReloadConfigRequest {
+                json_config: config_json.as_bytes().to_vec(),
+            };
+
+            // Call reload_config
+            let response = client.reload_config(reload_request).await?;
+            let reload_response = response.into_inner();
+
+            println!("Reload config response: {:?}", reload_response);
+
+            Ok(())
+        }
+
+        // Test batch_write RPC
+        #[tokio::test]
+        async fn test_batch_write() -> Result<(), Box<dyn std::error::Error>> {
+            let channel = Channel::from_static(SERVER_ADDRESS).connect().await?;
+            let mut client = LsmdbClient::new(channel);
+
+            // Prepare multiple put requests
+            let mut puts = vec![];
+            for i in 0..5 {
+                puts.push(PutRequest {
+                    key: format!("batch_key_{}", i).as_bytes().to_vec(),
+                    value: format!("batch_value_{}", i).as_bytes().to_vec(),
+                    metadata: Default::default(),
+                });
+            }
+
+            // Prepare multiple delete requests
+            let mut deletes = vec![];
+            for i in 5..8 {
+                deletes.push(DeleteRequest {
+                    key: format!("batch_key_{}", i).as_bytes().to_vec(),
+                });
+            }
+
+            // Create batch write request
+            let batch_request = BatchWriteRequest {
+                puts: puts.clone(),
+                deletes: deletes.clone(),
+            };
+
+            // Call batch_write
+            let response = client.batch_write(batch_request).await?;
+            let batch_response = response.into_inner();
+
+            println!("Batch write response: {:?}", batch_response);
+
+            // Verify that the puts were successful
+            for i in 0..5 {
+                let get_request = super::swiftmerge::GetRequest {
+                    key: format!("batch_key_{}", i).as_bytes().to_vec(),
+                    filter: None,
+                };
+                let response = client.get(get_request).await?;
+                let inner = response.into_inner();
+                assert_eq!(
+                    inner.value.unwrap(),
+                    format!("batch_value_{}", i).as_bytes().to_vec()
+                );
+            }
+
+            Ok(())
+        }
+
+        // Test batch_write with conflicting operations (put and delete same key)
+        #[tokio::test]
+        async fn test_batch_write_conflict_resolution() -> Result<(), Box<dyn std::error::Error>> {
+            let channel = Channel::from_static(SERVER_ADDRESS).connect().await?;
+            let mut client = LsmdbClient::new(channel);
+
+            let conflicting_key = b"conflict_key".to_vec();
+
+            // Create a batch write with both put and delete for the same key
+            let batch_request = BatchWriteRequest {
+                puts: vec![PutRequest {
+                    key: conflicting_key.clone(),
+                    value: b"conflict_value".to_vec(),
+                    metadata: Default::default(),
+                }],
+                deletes: vec![DeleteRequest {
+                    key: conflicting_key.clone(),
+                }],
+            };
+
+            // Call batch_write (put should take precedence)
+            let response = client.batch_write(batch_request).await?;
+            println!("Batch write with conflict response: {:?}", response);
+
+            // Verify that the key exists (put took precedence over delete)
+            let get_request = super::swiftmerge::GetRequest {
+                key: conflicting_key.clone(),
+                filter: None,
+            };
+            let response = client.get(get_request).await?;
+            let inner = response.into_inner();
+            assert_eq!(inner.value.unwrap(), b"conflict_value".to_vec());
+
+            Ok(())
+        }
+
+        // Test range RPC
+        #[tokio::test]
+        #[ignore] // Ignore this test for now as requested
+        async fn test_range() -> Result<(), Box<dyn std::error::Error>> {
+            let channel = Channel::from_static(SERVER_ADDRESS).connect().await?;
+            let mut client = LsmdbClient::new(channel);
+
+            // First, put some keys in a range
+            for i in 100..110 {
+                let put_request = PutRequest {
+                    key: format!("range_key_{:03}", i).as_bytes().to_vec(),
+                    value: format!("range_value_{}", i).as_bytes().to_vec(),
+                    metadata: Default::default(),
+                };
+                client.put(put_request).await?;
+            }
+
+            // Create range request
+            let range_request = RangeRequest {
+                start_key: b"range_key_100".to_vec(),
+                end_key: b"range_key_110".to_vec(),
+                filter: None,
+            };
+
+            // Call range (should return unimplemented for now)
+            let result = client.range(range_request).await;
+
+            // For now, expect unimplemented error
+            if let Err(status) = result {
+                assert_eq!(status.code(), tonic::Code::Unimplemented);
+                println!(
+                    "Range RPC correctly returns unimplemented: {}",
+                    status.message()
+                );
+            } else {
+                // When implemented, verify the response
+                let response = result.unwrap();
+                let range_response = response.into_inner();
+                println!("Range response: {:?}", range_response);
+                assert_eq!(range_response.results.len(), 10);
+            }
+
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod generate_test_data {
+    use super::*;
+    use crate::*;
+    use tonic::Request;
+    use tonic::transport::Channel;
+
+    const SERVER_ADDRESS: &str = "http://127.0.0.1:50051";
+
+    #[tokio::test]
+    #[ignore]
+    async fn generate_multiple_sstables() -> Result<(), Box<dyn std::error::Error>> {
+        // Import swiftmerge client
+        use super::swiftmerge::lsmdb_client::LsmdbClient;
+
+        // Connect to gRPC server
+        let channel = Channel::from_static(SERVER_ADDRESS).connect().await?;
+        let mut client = LsmdbClient::new(channel);
+
+        // Large list of keys to trigger multiple flushes
+        let test_keys = vec![
+            // Superheroes
+            "spider_man",
+            "iron_man",
+            "captain_america",
+            "thor",
+            "hulk",
+            "black_widow",
+            "hawkeye",
+            "doctor_strange",
+            "black_panther",
+            "ant_man",
+            "wasp",
+            "vision",
+            "scarlet_witch",
+            "winter_soldier",
+            "falcon",
+            "war_machine",
+            "star_lord",
+            "gamora",
+            "drax",
+            "rocket_raccoon",
+            "groot",
+            "mantis",
+            "nebula",
+            "loki",
+            "valkyrie",
+            // Villains
+            "thanos",
+            "ultron",
+            "red_skull",
+            "hela",
+            "killmonger",
+            "vulture",
+            "mysterio",
+            "green_goblin",
+            "doc_ock",
+            "venom",
+            "carnage",
+            "magneto",
+            "mystique",
+            "juggernaut",
+            "sabretooth",
+            // X-Men
+            "wolverine",
+            "cyclops",
+            "jean_grey",
+            "storm",
+            "rogue",
+            "beast",
+            "nightcrawler",
+            "colossus",
+            "kitty_pryde",
+            "iceman",
+            "angel",
+            "professor_x",
+            "gambit",
+            "jubilee",
+            "psylocke",
+            // Fantastic Four
+            "mr_fantastic",
+            "invisible_woman",
+            "human_torch",
+            "the_thing",
+            // Street Level
+            "daredevil",
+            "punisher",
+            "luke_cage",
+            /*
+            "iron_fist",
+            "jessica_jones",
+            "elektra",
+            "blade",
+            "moon_knight",
+            "ghost_rider",
+            "deadpool",
+            // Cosmic
+            "silver_surfer",
+            "galactus",
+            "nova",
+            "captain_marvel",
+            "ms_marvel",
+            "adam_warlock",
+            "quasar",
+            "beta_ray_bill",
+            // More heroes to trigger multiple flushes
+            "she_hulk",
+            "hawkgirl",
+            "aquaman",
+            "flash",
+            "green_lantern",
+            "cyborg",
+            "martian_manhunter",
+            "wonder_woman",
+            "superman",
+            "batman",
+            "nightwing",
+            "robin",
+            "batgirl",
+            "supergirl",
+            "shazam",
+            "plastic_man",
+            "atom",
+            "firestorm",
+            "booster_gold",
+            "blue_beetle",*/
+        ];
+
+        // Create 10KB zero'd out value
+        let power_data = vec![0u8; 10_000];
+
+        println!("Starting to insert {} entries via gRPC...", test_keys.len());
+
+        for (idx, hero) in test_keys.iter().enumerate() {
+            let request = Request::new(PutRequest {
+                key: hero.as_bytes().to_vec(),
+                value: power_data.clone(),
+                metadata: std::collections::HashMap::new(),
+            });
+
+            match client.put(request).await {
+                Ok(response) => {
+                    if idx % 10 == 0 {
+                        println!("Inserted {} entries so far", idx);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to insert '{}': {}", hero, e);
+                }
+            }
+        }
+
+        println!("\n=== Test Data Generation Complete ===");
+        println!("Total keys inserted: {}", test_keys.len());
+        println!("Check data/l1/ directory for generated SS-table files");
+        println!("Server should have triggered multiple flushes based on ram_max_size config");
+
+        Ok(())
     }
 }

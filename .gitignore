@@ -3,3 +3,7 @@
 switft-merge/target/**
 switft-merge/target/
 *.log
+switft-merge/tmp/**
+switft-merge/tmp/
+switft-merge/test_metrics/**
+swift-merge/Wal.tmp

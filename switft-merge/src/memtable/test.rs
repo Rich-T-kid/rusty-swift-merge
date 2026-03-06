@@ -295,8 +295,8 @@ mod deserialize_test {
         use std::io::Write;
 
         use crate::memtable::mem::{
-            Memtable, MemtableError, TOMB_STONE_BYTE_REPRESENTATION, TableEntry, TransitiveRepr,
-            WalEntry,
+            ConfigSource, Memtable, MemtableError, TOMB_STONE_BYTE_REPRESENTATION, TableEntry,
+            TransitiveRepr, WalEntry,
         };
 
         #[test]
@@ -307,7 +307,7 @@ mod deserialize_test {
                 .to_wal_entry(&mut buffer, key, WalEntry::Tombstone())
                 .unwrap();
 
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             mg.rebuild_memtable(buffer).unwrap();
 
             let result = mg.get(key).unwrap();
@@ -322,7 +322,7 @@ mod deserialize_test {
             TransitiveRepr::new()
                 .to_wal_entry(&mut buffer, key, WalEntry::Value(&table_entry))
                 .unwrap();
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             mg.rebuild_memtable(buffer).unwrap();
 
             let result = mg.get(key).unwrap();
@@ -356,7 +356,7 @@ mod deserialize_test {
                 .to_wal_entry(&mut buffer, key, WalEntry::Value(&table_entry))
                 .unwrap();
 
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             mg.rebuild_memtable(buffer).unwrap();
             let result = mg.get(key).unwrap();
             assert_eq!(*result, Some(table_entry));
@@ -373,7 +373,7 @@ mod deserialize_test {
                 .to_wal_entry(&mut buffer, key, WalEntry::Value(&table_entry))
                 .unwrap();
 
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             mg.rebuild_memtable(buffer).unwrap();
             println!("{:?}", mg);
             let result = mg.get(key).unwrap();
@@ -391,7 +391,7 @@ mod deserialize_test {
                 .write_all(&TOMB_STONE_BYTE_REPRESENTATION.to_le_bytes())
                 .unwrap();
 
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             let result = mg.rebuild_memtable(buffer);
 
             assert!(result.is_err());
@@ -408,7 +408,7 @@ mod deserialize_test {
             buffer.write_all(&100u32.to_le_bytes()).unwrap(); // key length = 100
             buffer.write_all(b"tiny").unwrap(); // only 4 bytes 
 
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             let result = mg.rebuild_memtable(buffer);
 
             assert!(result.is_err());
@@ -428,7 +428,7 @@ mod deserialize_test {
             buffer.write_all(&50u32.to_le_bytes()).unwrap(); // claims 50 bytes
             buffer.write_all(b"small_value").unwrap(); // only 11 bytes
 
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             let result = mg.rebuild_memtable(buffer);
 
             assert!(result.is_err());
@@ -448,7 +448,7 @@ mod deserialize_test {
             buffer.write_all(&1000u32.to_le_bytes()).unwrap(); // claims 1000 bytes
             buffer.write_all(b"val").unwrap(); // only 3 bytes
 
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             let result = mg.rebuild_memtable(buffer);
 
             assert!(result.is_err());
@@ -462,7 +462,7 @@ mod deserialize_test {
         fn test_empty_buffer() {
             let buffer: Vec<u8> = Vec::new();
 
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             let result = mg.rebuild_memtable(buffer);
 
             assert!(result.is_ok());
@@ -474,7 +474,7 @@ mod deserialize_test {
             let mut buffer: Vec<u8> = Vec::new();
             buffer.write_all(&5u32.to_le_bytes()).unwrap();
 
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             let result = mg.rebuild_memtable(buffer);
 
             assert!(result.is_err());
@@ -494,7 +494,7 @@ mod deserialize_test {
                 .write_all(&TOMB_STONE_BYTE_REPRESENTATION.to_le_bytes())
                 .unwrap();
 
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             let result = mg.rebuild_memtable(buffer);
 
             assert!(result.is_err());
@@ -512,7 +512,7 @@ mod deserialize_test {
             buffer.write_all(&(key.len() as u32).to_le_bytes()).unwrap();
             buffer.write_all(key).unwrap();
             buffer.write_all(&0u32.to_le_bytes()).unwrap(); // value length = 0
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             let result = mg.rebuild_memtable(buffer);
 
             assert!(result.is_err());
@@ -528,8 +528,8 @@ mod deserialize_test {
         use std::io::Write;
 
         use crate::memtable::mem::{
-            Memtable, MemtableError, TableEntry, TransitiveRepr, TrueTypes, TypeInfoMetadata,
-            WalEntry,
+            ConfigSource, Memtable, MemtableError, TableEntry, TransitiveRepr, TrueTypes,
+            TypeInfoMetadata, WalEntry,
         };
         use std::collections::BTreeMap;
 
@@ -558,7 +558,7 @@ mod deserialize_test {
                 .to_wal_entry(&mut buffer, key3, WalEntry::Value(&table_entry3))
                 .unwrap();
             // Rebuild memtable
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             mg.rebuild_memtable(buffer).unwrap();
 
             // Verify all three keys
@@ -641,7 +641,7 @@ mod deserialize_test {
                 .unwrap();
 
             // Rebuild memtable
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             mg.rebuild_memtable(buffer).unwrap();
 
             // Verify all four keys
@@ -683,7 +683,7 @@ mod deserialize_test {
                 .unwrap();
 
             // Rebuild memtable
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             mg.rebuild_memtable(buffer).unwrap();
 
             // Verify all three keys
@@ -728,7 +728,7 @@ mod deserialize_test {
             buffer.write_all(b"shortvalue").unwrap(); // only 10 bytes
 
             // Attempt to rebuild memtable - should fail
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             let result = mg.rebuild_memtable(buffer);
 
             assert!(result.is_err());
@@ -767,7 +767,7 @@ mod deserialize_test {
                 .unwrap();
 
             // Rebuild memtable
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
             mg.rebuild_memtable(buffer).unwrap();
 
             // Verify all four keys are tombstones
@@ -789,12 +789,14 @@ mod deserialize_test {
     mod memtable_recovery_test {
         use std::collections::BTreeMap;
 
-        use crate::memtable::mem::{Memtable, TableEntry, TrueTypes, TypeInfoMetadata};
+        use crate::memtable::mem::{
+            ConfigSource, Memtable, TableEntry, TrueTypes, TypeInfoMetadata,
+        };
 
         #[test]
         fn test_memtable_persists_after_drop() {
             // Create first memtable and insert values
-            let mut mg = Memtable::new().unwrap();
+            let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
 
             mg.put(
                 b"user:1001",
@@ -861,7 +863,7 @@ mod deserialize_test {
             drop(mg);
 
             // Create a new memtable and verify all keys still exist
-            let mut mg2 = Memtable::new().unwrap();
+            let mut mg2 = Memtable::new(ConfigSource::Default()).unwrap();
 
             let keys = vec![
                 "user:1001",

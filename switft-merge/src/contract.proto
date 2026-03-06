@@ -1,21 +1,25 @@
-/*
-things to add:  
-- batch put / delete
-- range get / delete
-
-these are backwards compatible additions so i will add them later
-*/
 syntax = "proto3";
 
 package swiftmerge.v01;
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
 
 service LSMDB{
+  rpc HealthCheck(google.protobuf.Empty) returns (HealthCheckResponse);
   rpc Put(PutRequest) returns (GenericResponse); 
   rpc Delete(DeleteRequest) returns (GenericResponse); 
+  rpc BatchWrite(BatchWriteRequest) returns (GenericResponse);
   rpc Get(GetRequest) returns (GetResponse);
+  rpc Range(RangeRequest) returns (RangeResponse);
+  rpc GracefulShutdown(google.protobuf.Empty) returns (GenericResponse);
+  rpc ReloadConfig(ReloadConfigRequest) returns (GenericResponse);
   rpc WriteMetrics(WriteMetricsRequest) returns (WriteMetricsResponse);
   rpc ReadMetrics(ReadMetricsRequest)  returns (ReadMetricsResponse);
 };
+message HealthCheckResponse{
+  google.protobuf.Timestamp time_stamp = 1;
+  
+}
 message PutRequest {
   bytes key = 1;
   bytes value = 2;
@@ -23,6 +27,12 @@ message PutRequest {
 };
 message DeleteRequest{
   bytes key = 1;
+}
+// put request are executed first followed by delete requests
+// (if same key is in both put and delete , delete is ignored)
+message BatchWriteRequest{
+  repeated PutRequest puts = 1;
+  repeated DeleteRequest deletes = 2;
 }
 message GenericResponse{
 }
@@ -38,6 +48,22 @@ message GetResponse{
   optional bytes value =1;
   map<string,TypeInfo> metadata = 2; 
 }
+message RangeRequest{
+  bytes start_key = 1;
+  bytes end_key = 2;
+  FilterParam filter = 3; // optional filter to apply on metadata
+}
+message RangeResponse{
+  message KeyValuePair{
+    bytes key = 1;
+    bytes value = 2;
+    map<string,TypeInfo> metadata = 3; 
+  }
+  repeated KeyValuePair results = 1;
+}
+message ReloadConfigRequest{
+  bytes json_config = 1; // base64 encoded json config
+}
 message WriteMetricsRequest{
   SuccessfulWritesMetric write_metrics = 1;
   AverageLatency avg_latency = 2;
@@ -49,7 +75,6 @@ message AverageLatency{
 }
 message SuccessfulWritesMetric{
   bool use = 1;
-  uint64 write_ahead_log = 2;
   uint64 memtable = 3;
   // if mins == 0  => return all results
   uint64 mins = 4; // keep this strictly defined (1 min , 5 , 10 , 30 )
@@ -59,8 +84,9 @@ message WriteMetricsResponse{
   AverageLatencyResponse avg_response = 4;
 }
 message WriteMetrics{
-  uint64 wal_count = 1;
-  uint64 memtable_count = 2;
+  uint64 total_writes = 1;
+  uint64 ss_table_count = 2;
+  uint64 ss_table_merged = 3;
 }
 message AverageLatencyResponse{
   uint64 latency = 1;
