@@ -230,16 +230,6 @@ impl TableEntry {
         }
     }
 }
-#[derive(Debug)]
-pub struct Memtable {
-    pub wal: WalManager,
-    in_memory_repr: BTreeMap<Vec<u8>, Option<TableEntry>>,
-    config: Option<ConfigInfo>,
-    memory_metrics: Arc<Mutex<MemMetricTracker>>,
-    disk_metrics: Arc<Mutex<DiskTreeMetricTracker>>,
-    flush_by: time::Instant,
-    current_size_bytes: u32,
-}
 
 pub struct TransitiveRepr {}
 impl TransitiveRepr {
@@ -378,6 +368,18 @@ fn periodic_metric_flush(metrics: Vec<Arc<Mutex<dyn MetricTracker>>>) {
         thread::sleep(time::Duration::new(60, 0));
     }
 }
+#[derive(Debug)]
+pub struct Memtable {
+    pub wal: WalManager,
+    in_memory_repr: BTreeMap<Vec<u8>, Option<TableEntry>>,
+    pub config: Option<ConfigInfo>,
+    memory_metrics: Arc<Mutex<MemMetricTracker>>,
+    disk_metrics: Arc<Mutex<DiskTreeMetricTracker>>,
+    flush_by: time::Instant,
+    current_size_bytes: u32,
+}
+// TODO: make put() & delete() async so that flush can be async and work with tokio::fs::File so that calls dont block on flushes
+
 impl Memtable {
     // ! update new() to take in ConfigSource, should be configured here
     pub fn new(config: ConfigSource) -> Result<Self, MemtableError> {
@@ -904,15 +906,15 @@ impl Memtable {
 }
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-struct ConfigInfo {
+pub struct ConfigInfo {
     ram_max_size: u32,
     ram_max_time: u16,
-    target_chunks: u8,
-    compaction_check_interval_seconds: u16,
+    pub(crate) target_chunks: u8,
+    pub(crate) compaction_check_interval_seconds: u16,
     wal_enabled: bool,
     bloom_false_positive_rate: f64,
-    max_compaction_threads: u8,
-    local_disk: bool,
+    pub(crate) max_compaction_threads: u8,
+    pub(crate) local_disk: bool,
 }
 impl ConfigInfo {
     const KILOBYTE: u32 = 1024;

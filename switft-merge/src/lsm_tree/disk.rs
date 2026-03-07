@@ -1,3 +1,4 @@
+use prost_types::compiler::code_generator_response::File;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Display;
@@ -138,73 +139,10 @@ impl LsmTreeReader {
     // read only
     //
     pub async fn new() -> Result<Self, LsmTreeError> {
-        let data_dir = std::path::Path::new("data");
-
-        // Check if data directory exists, return empty if it doesn't (no data yet is okay)
-        if !data_dir.exists() {
-            return Ok(Self {
-                level_array: Vec::new(),
-            });
-        }
-
-        let mut level_array: Vec<FileMap> = Vec::new();
-
-        // Read each level directory starting from l1
-        let mut level_num = 1;
-        loop {
-            let level_dir = data_dir.join(format!("l{}", level_num));
-
-            // Stop when we can't find the next level directory
-            if !level_dir.exists() {
-                break;
-            }
-
-            let mut file_map: FileMap = HashMap::new();
-
-            // Read all files in this level directory
-            let entries =
-                fs::read_dir(&level_dir).map_err(|e| LsmTreeError::InitFailure(e.to_string()))?;
-
-            for entry in entries {
-                let entry = entry.map_err(|e| LsmTreeError::IOErr(e))?;
-                let path = entry.path();
-
-                // Only process .bin files
-                if path.extension().and_then(|s| s.to_str()) == Some("bin") {
-                    // Open file for TableReader
-                    let file = tokio_fs::File::open(&path)
-                        .await
-                        .map_err(|e| LsmTreeError::IOErr(e))?;
-
-                    let mut table_reader =
-                        TableReader::new(file).map_err(|e| LsmTreeError::IOErr(e))?;
-
-                    let crc = table_reader.read_header().await?;
-                    if crc != HEADER_CRC.as_bytes() {
-                        println!(
-                            "{:?} contains an invalid crc header {:?}, skipping file",
-                            path, crc
-                        );
-                        continue;
-                    }
-
-                    // Generate index metadata
-                    let metadata = table_reader
-                        .generate_index()
-                        .await
-                        .map_err(|e| LsmTreeError::IOErr(e))?;
-
-                    // Insert with SSTableMetaData as key
-                    file_map.insert(metadata, table_reader);
-                }
-            }
-
-            // Add this level's FileMap to the level_array
-            level_array.push(file_map);
-            level_num += 1;
-        }
-
-        Ok(Self { level_array })
+        let levels = LsmTreeReader::create_level_array().await?;
+        Ok(Self {
+            level_array: levels,
+        })
     }
 
     /*
@@ -283,6 +221,72 @@ impl LsmTreeReader {
     // compaction will notify lsmreader to reload the directory to reconstruct the ss-table metadata
     fn reload(&mut self) -> Result<(), LsmTreeError> {
         Ok(())
+    }
+    async fn create_level_array() -> Result<Vec<FileMap>, LsmTreeError> {
+        let data_dir = std::path::Path::new("data");
+
+        // Check if data directory exists, return empty if it doesn't (no data yet is okay)
+        if !data_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut level_array: Vec<FileMap> = Vec::new();
+
+        // Read each level directory starting from l1
+        let mut level_num = 1;
+        loop {
+            let level_dir = data_dir.join(format!("l{}", level_num));
+
+            // Stop when we can't find the next level directory
+            if !level_dir.exists() {
+                break;
+            }
+
+            let mut file_map: FileMap = HashMap::new();
+
+            // Read all files in this level directory
+            let entries =
+                fs::read_dir(&level_dir).map_err(|e| LsmTreeError::InitFailure(e.to_string()))?;
+
+            for entry in entries {
+                let entry = entry.map_err(|e| LsmTreeError::IOErr(e))?;
+                let path = entry.path();
+
+                // Only process .bin files
+                if path.extension().and_then(|s| s.to_str()) == Some("bin") {
+                    // Open file for TableReader
+                    let file = tokio_fs::File::open(&path)
+                        .await
+                        .map_err(|e| LsmTreeError::IOErr(e))?;
+
+                    let mut table_reader =
+                        TableReader::new(file).map_err(|e| LsmTreeError::IOErr(e))?;
+
+                    let crc = table_reader.read_header().await?;
+                    if crc != HEADER_CRC.as_bytes() {
+                        println!(
+                            "{:?} contains an invalid crc header {:?}, skipping file",
+                            path, crc
+                        );
+                        continue;
+                    }
+
+                    // Generate index metadata
+                    let metadata = table_reader
+                        .generate_index()
+                        .await
+                        .map_err(|e| LsmTreeError::IOErr(e))?;
+
+                    // Insert with SSTableMetaData as key
+                    file_map.insert(metadata, table_reader);
+                }
+            }
+
+            // Add this level's FileMap to the level_array
+            level_array.push(file_map);
+            level_num += 1;
+        }
+        Ok(level_array)
     }
 }
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]

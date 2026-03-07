@@ -28,6 +28,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Config loaded successfully, starting application...");
 
     // --- Start gRPC Server ---
+    let compaction = Arc::new(lsm_tree::compaction::CompactionCoordinator::new(
+        &table.config.as_ref().unwrap(),
+        vec![],
+    ));
     let memtable_instance = Arc::new(RwLock::new(table));
     let lsm_tree = Arc::new(LsmTreeReader::new().await?);
 
