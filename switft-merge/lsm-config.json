@@ -1,8 +1,8 @@
 {
     "ramMaxSize": 150000,
     "ramMaxTime": 3600,
-    "targetChunks": 4,
-    "compactionCheckIntervalSeconds": 3600,
+    "targetChunks": 2,
+    "compactionCheckIntervalSeconds": 40,
     "walEnabled": true,
     "bloomFalsePositiveRate": 0.05,
     "maxCompactionThreads": 2,
