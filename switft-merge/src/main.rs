@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compaction = CompactionCoordinator::new(
         &table.config.as_ref().unwrap(),
         vec![(
-            CompactionEvents::CompactonStarted,
+            CompactionEvents::CompactionStarted,
             Box::new(move || {
                 let lsm_tree = lsm_tree_reader_instance_clone.clone();
                 tokio::spawn(async move {

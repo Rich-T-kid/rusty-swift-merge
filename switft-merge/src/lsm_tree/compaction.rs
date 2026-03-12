@@ -1,17 +1,15 @@
 // BASE BRANCH Issue #21
 use std::collections::HashMap;
-use std::fs;
 use std::io;
 use std::sync::Arc;
-use std::sync::RwLock;
-use std::thread;
+use tokio::fs;
 //use tokio::sync::RwLock;
 
 use crate::memtable::mem::ConfigInfo;
 #[derive(PartialEq, Eq, Hash)]
 pub enum CompactionEvents {
     Init, // for config changes
-    CompactonStarted,
+    CompactionStarted,
     CompactionFinished(u16, u16), // ssTableReader needs to know to update indexes : (input ss-tables,output-sstables)
 }
 pub enum DataSectionErr {
@@ -60,20 +58,24 @@ impl CompactionCoordinator {
         }
     }
 
-    pub fn monitor(moniter: Arc<tokio::sync::RwLock<CompactionCoordinator>>) {
+    pub fn monitor(compaction_monitor: Arc<tokio::sync::RwLock<CompactionCoordinator>>) {
         tokio::spawn(async move {
             loop {
                 {
                     let data_dir = std::path::Path::new("data");
                     if !data_dir.exists() {
-                        fs::create_dir_all(data_dir).unwrap();
+                        fs::create_dir_all(data_dir).await.unwrap();
                     }
                     let l1_dir = data_dir.join("l1");
                     if !l1_dir.exists() {
-                        fs::create_dir_all(&l1_dir).unwrap();
+                        fs::create_dir_all(&l1_dir).await.unwrap();
                     }
-                    let small_ss_table_count = fs::read_dir(l1_dir).unwrap().count();
-                    let mut lock = moniter.write().await;
+                    let mut read_dir = fs::read_dir(l1_dir).await.unwrap();
+                    let mut small_ss_table_count = 0;
+                    while let Some(_entry) = read_dir.next_entry().await.unwrap() {
+                        small_ss_table_count += 1;
+                    }
+                    let mut lock = compaction_monitor.write().await;
                     if std::time::Instant::now() >= lock.compact_by
                         || small_ss_table_count > (lock.config.target_chunks as usize).pow(2)
                     {
@@ -85,11 +87,15 @@ impl CompactionCoordinator {
                     }
                 }
                 let interval = {
-                    let read_lock = moniter.read().await;
+                    let read_lock = compaction_monitor.read().await;
                     read_lock.config.compaction_check_interval_seconds
                 };
                 println!("waiting for {} seconds", (interval / 4));
-                tokio::time::sleep(std::time::Duration::from_secs((interval as u64) / 4)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(std::cmp::max(
+                    10,
+                    (interval as u64) / 4,
+                )))
+                .await;
             }
         });
 

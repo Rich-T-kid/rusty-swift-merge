@@ -221,6 +221,8 @@ impl LsmTreeReader {
     // compaction will notify lsmreader to reload the directory to reconstruct the ss-table metadata
     pub async fn reload(&mut self) -> Result<(), LsmTreeError> {
         println!("running reload code for [LsmTreeReader] ");
+        let new_levels = LsmTreeReader::create_level_array().await?;
+        self.level_array = new_levels;
         Ok(())
     }
     async fn create_level_array() -> Result<Vec<FileMap>, LsmTreeError> {
