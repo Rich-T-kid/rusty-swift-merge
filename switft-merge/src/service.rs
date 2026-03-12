@@ -1824,7 +1824,6 @@ mod generate_test_data {
             "daredevil",
             "punisher",
             "luke_cage",
-            /*
             "iron_fist",
             "jessica_jones",
             "elektra",
@@ -1861,7 +1860,7 @@ mod generate_test_data {
             "atom",
             "firestorm",
             "booster_gold",
-            "blue_beetle",*/
+            "blue_beetle",
         ];
 
         // Create 10KB zero'd out value
