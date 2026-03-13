@@ -5,14 +5,12 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
-//use tokio::sync::RwLock;
 
 use crate::memtable::mem::ConfigInfo;
 #[derive(PartialEq, Eq, Hash)]
 pub enum CompactionEvents {
-    Init, // for config changes
-    CompactionStarted,
-    CompactionFinished(u16, u16), // ssTableReader needs to know to update indexes : (input ss-tables,output-sstables)
+    Init,               // for config changes
+    CompactionFinished, // ssTableReader needs to know to update indexes : (input ss-tables,output-sstables)
 }
 #[derive(Debug)]
 pub enum DataSectionErr {
@@ -199,6 +197,15 @@ impl CompactionCoordinator {
             // current_directory -> cur+1_directory
         }
         // build summary table (min,max,level wide bloom filter)
+        self.build_level_summary().await?;
+        if let Some(compact_finish_funcs) = self
+            .update_funcs
+            .get_mut(&CompactionEvents::CompactionFinished)
+        {
+            for func in compact_finish_funcs.iter_mut() {
+                func();
+            }
+        }
 
         Ok(())
     }

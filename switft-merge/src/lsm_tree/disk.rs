@@ -2,7 +2,6 @@ use prost_types::compiler::code_generator_response::File;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Display;
-use std::fs;
 use std::io;
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -16,7 +15,6 @@ pub const PAGE_PER_BLOCK: usize = 4;
 #[derive(Debug)]
 pub enum LsmTreeError {
     IOErr(io::Error),
-    UnknownErr(Box<dyn std::error::Error>),
     InitFailure(String),
 }
 type SearchMetaData = (u16, u8); // u16: number of ss-tables searched, u8: number of levels searched
@@ -28,7 +26,6 @@ impl Display for LsmTreeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LsmTreeError::IOErr(err) => write!(f, "IO error: {}", err),
-            LsmTreeError::UnknownErr(err) => write!(f, "Unknown error: {}", err),
             LsmTreeError::InitFailure(msg) => write!(f, "Initialization failure: {}", msg),
         }
     }
@@ -37,7 +34,6 @@ impl Error for LsmTreeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             LsmTreeError::IOErr(err) => Some(err),
-            LsmTreeError::UnknownErr(err) => Some(err.as_ref()),
             LsmTreeError::InitFailure(_) => None,
         }
     }
@@ -229,7 +225,7 @@ impl LsmTreeReader {
         let data_dir = std::path::Path::new("data");
 
         // Check if data directory exists, return empty if it doesn't (no data yet is okay)
-        if !data_dir.exists() {
+        if !tokio_fs::try_exists(data_dir).await? {
             return Ok(Vec::new());
         }
 
@@ -241,18 +237,18 @@ impl LsmTreeReader {
             let level_dir = data_dir.join(format!("l{}", level_num));
 
             // Stop when we can't find the next level directory
-            if !level_dir.exists() {
+            if !tokio_fs::try_exists(&level_dir).await? {
                 break;
             }
 
             let mut file_map: FileMap = HashMap::new();
 
             // Read all files in this level directory
-            let entries =
-                fs::read_dir(&level_dir).map_err(|e| LsmTreeError::InitFailure(e.to_string()))?;
+            let mut entries = tokio_fs::read_dir(&level_dir)
+                .await
+                .map_err(|e| LsmTreeError::InitFailure(e.to_string()))?;
 
-            for entry in entries {
-                let entry = entry.map_err(|e| LsmTreeError::IOErr(e))?;
+            while let Some(entry) = entries.next_entry().await.map_err(LsmTreeError::IOErr)? {
                 let path = entry.path();
 
                 // Only process .bin files

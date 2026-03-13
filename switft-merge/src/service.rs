@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::sync::{Arc, RwLock};
 use tokio::io::AsyncReadExt;
-use tokio::sync::RwLock as async_RwLock;
+use tokio::sync::RwLock as TokioRwLock;
 use tonic::{Request, Response, Status, transport::Server};
 
 use crate::lsm_tree::disk::LsmTreeReader;
@@ -68,12 +68,12 @@ pub struct MyLsmDb {
     // we wrap memtable in read-write-lock for thread-safe access from grpc threads
     // lsm-tree is write heavy in nature so it make sense t
     memtable_mutex: Arc<RwLock<Memtable>>,
-    lsm_tree: Arc<async_RwLock<LsmTreeReader>>,
+    lsm_tree: Arc<TokioRwLock<LsmTreeReader>>,
 }
 
 impl MyLsmDb {
     // create a new instance of our service with a shared memtable
-    pub fn new(mem: Arc<RwLock<Memtable>>, lsm: Arc<async_RwLock<LsmTreeReader>>) -> Self {
+    pub fn new(mem: Arc<RwLock<Memtable>>, lsm: Arc<TokioRwLock<LsmTreeReader>>) -> Self {
         MyLsmDb {
             memtable_mutex: mem,
             lsm_tree: lsm,
@@ -533,7 +533,7 @@ pub fn init_logger() -> Result<(), Box<dyn std::error::Error>> {
 // helper function to start the grpc server
 pub async fn run_server(
     memtable: Arc<RwLock<Memtable>>,
-    lsm_tree: Arc<async_RwLock<LsmTreeReader>>,
+    lsm_tree: Arc<TokioRwLock<LsmTreeReader>>,
     addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let lsm_db = MyLsmDb::new(memtable, lsm_tree);
