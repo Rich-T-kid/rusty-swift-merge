@@ -8,8 +8,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::RwLock;
 
 use crate::memtable::mem::TableEntry;
-pub const HEADER_CRC: &str = "054a62a514e1d7d93b2955772fe6070d03a9d58f34a42d85918ac975488dbbe4"; // ! have this be injected as a secret
-const BLOOM_FILTER_SIZE: usize = 1000;
+pub const HEADER_CRC: &str = "054a62a514e1d7d93b2955772fe6070d03a9d58f34a42d85918ac975488dbbe4";
+pub const BLOOM_FILTER_SIZE: usize = 1000;
 pub const PAGE_PER_BLOCK: usize = 4;
 
 #[derive(Debug)]

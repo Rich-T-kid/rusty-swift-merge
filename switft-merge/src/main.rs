@@ -44,7 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let lsm_tree = lsm_tree_reader_instance_clone.clone();
                 tokio::spawn(async move {
                     let mut instance = lsm_tree.write().await;
-                    let _ = instance.reload().await;
+                    if let Err(err) = instance.reload().await {
+                        log::error!("failed to reload LSM tree after compaction: {:?}", err)
+                    }
                 });
             }),
         )],
