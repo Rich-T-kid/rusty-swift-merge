@@ -1738,6 +1738,8 @@ mod integration_tests {
 
 #[cfg(test)]
 mod generate_test_data {
+    use std::clone;
+
     use super::*;
     use crate::*;
     use tonic::Request;
@@ -1782,7 +1784,7 @@ mod generate_test_data {
             "mantis",
             "nebula",
             "loki",
-            "valkyrie",
+            /*"valkyrie",
             // Villains
             "thanos",
             "ultron",
@@ -1860,7 +1862,7 @@ mod generate_test_data {
             "atom",
             "firestorm",
             "booster_gold",
-            "blue_beetle",
+            "blue_beetle",*/
         ];
 
         // Create 10KB zero'd out value
@@ -1886,6 +1888,13 @@ mod generate_test_data {
                 }
             }
         }
+        /*
+        client
+            .delete(Request::new(DeleteRequest {
+                key: "drax".as_bytes().to_vec(),
+            }))
+            .await?;
+        */
 
         println!("\n=== Test Data Generation Complete ===");
         println!("Total keys inserted: {}", test_keys.len());

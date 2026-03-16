@@ -5,7 +5,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::memtable::mem::ConfigInfo;
 #[derive(PartialEq, Eq, Hash)]
@@ -14,16 +14,11 @@ pub enum CompactionEvents {
     CompactionFinished, // ssTableReader needs to know to update indexes : (input ss-tables,output-sstables)
 }
 #[derive(Debug)]
-pub enum DataSectionErr {
-    NotSorted(Vec<u8>, Vec<u8>), // prev key, cur key do not have a prev < cur relationship
-}
-
-#[derive(Debug)]
 pub enum TableCorruption {
-    InvalidCRC(Vec<u8>),              //crc that was there instead of the correct one
-    InvalidFooter(String),            // footer places in wrong space?
-    InvalidSparseIndex(),             // missing sparse index len or missing sparse index
-    DataSectionError(DataSectionErr), // what ever other error will be this
+    InvalidCRC(Vec<u8>),      //crc that was there instead of the correct one
+    InvalidFooter(String),    // footer places in wrong space?
+    InvalidSparseIndex(),     // missing sparse index len or missing sparse index
+    DataSectionError(String), // what ever other error will be this
 }
 #[derive(Debug)]
 pub enum CompactionError {
@@ -178,7 +173,7 @@ impl CompactionCoordinator {
         // Compact each unit
         let mut compacted_tmp_files = Vec::new();
         for (id, unit) in compaction_units.iter_mut().enumerate() {
-            match unit.compact(id, dir).await {
+            match unit.compact(id, dir, dir_level + 1).await {
                 Ok(result) => compacted_tmp_files.push(result),
                 Err(e) => eprintln!("Compaction unit: {} failed: {:?}", id, e),
             }
@@ -196,10 +191,8 @@ impl CompactionCoordinator {
             let new_name = compacted_file
                 .replace(Self::TRANSITION_MERGED_SSTABLE_EXT, Self::SS_TABLE_FILE_EXT);
 
-            // Source: current directory + filename
             let source_path = dir.join(compacted_file); // data/l1/test_drive.tmp
 
-            // Destination: next level + new name
             let dest_path = next_level.join(&new_name); // data/l2/test_drive.bin
 
             println!(
@@ -210,8 +203,7 @@ impl CompactionCoordinator {
             tokio::fs::rename(&source_path, &dest_path).await?;
         }
         // build summary table (min,max,level wide bloom filter)
-        self.build_level_summary().await?;
-        // let interested parties know compaction has finished; mabey place in seperate function or in monitor
+        self.build_level_summary(dir_level + 1).await?;
         if let Some(compact_finish_funcs) = self
             .update_funcs
             .get_mut(&CompactionEvents::CompactionFinished)
@@ -223,8 +215,83 @@ impl CompactionCoordinator {
 
         Ok(())
     }
-    async fn build_level_summary(&mut self) -> CompactionResult<()> {
+    async fn build_level_summary(&mut self, level: u8) -> CompactionResult<()> {
+        let level_dir = std::path::Path::new(Self::BASE_DIRECTORY).join(format!("l{}", level));
+        if !level_dir.exists() {
+            return Err(CompactionError::CompactionIoError(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("level directory missing: {}", level_dir.display()),
+            )));
+        }
+
+        let mut read_dir = tokio::fs::read_dir(&level_dir).await?;
+        let mut bin_files: Vec<String> = Vec::new();
+        while let Some(entry) = read_dir.next_entry().await? {
+            let file_name = entry.file_name();
+            if let Some(name) = file_name.to_str() {
+                if name.ends_with(Self::SS_TABLE_FILE_EXT) {
+                    bin_files.push(name.to_string());
+                }
+            }
+        }
+
+        let mut min_key: Option<Vec<u8>> = None;
+        let mut max_key: Option<Vec<u8>> = None;
+
+        for file_name in &bin_files {
+            let file = tokio::fs::File::open(level_dir.join(file_name)).await?;
+            let (mut data_section, data_section_size) =
+                CompactionUnit::to_data_section(file_name, TableType::SSTable(file)).await?;
+
+            let mut ptr = 0usize;
+            while ptr < data_section_size {
+                let ((key, _value), bytes_read) =
+                    CompactionUnit::read_data_section_entry(file_name, &mut data_section).await?;
+                ptr += bytes_read;
+
+                // ! Issue #9
+                // TODO: Feed each key into the level-wide bloom filter builder.
+
+                match &min_key {
+                    Some(current) if key >= *current => {}
+                    _ => min_key = Some(key.clone()),
+                }
+                match &max_key {
+                    Some(current) if key <= *current => {}
+                    _ => max_key = Some(key),
+                }
+            }
+        }
+
+        let min_u64 = min_key
+            .as_ref()
+            .map(|key| Self::key_to_u64(key))
+            .unwrap_or(0);
+        let max_u64 = max_key
+            .as_ref()
+            .map(|key| Self::key_to_u64(key))
+            .unwrap_or(0);
+
+        let bloom_size = super::disk::BLOOM_FILTER_SIZE * bin_files.len();
+        let mut level_summary = Vec::with_capacity(16 + bloom_size);
+        level_summary.extend_from_slice(&min_u64.to_le_bytes());
+        level_summary.extend_from_slice(&max_u64.to_le_bytes());
+        level_summary.extend_from_slice(&vec![0u8; bloom_size]);
+
+        let level_filter_path = level_dir.join("level.filter");
+        tokio::fs::write(level_filter_path, level_summary).await?;
+
         Ok(())
+    }
+    fn key_to_u64(key: &[u8]) -> u64 {
+        // TODO(Issue #9): Replace this temporary hash marker with true key boundary encoding.
+        // Deterministic 64-bit FNV-1a hash for compact min/max key markers.
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in key {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
     }
 }
 #[derive(Debug)]
@@ -242,7 +309,12 @@ impl CompactionUnit {
     const SPARSE_INDEX_SIZE_FIELD_LEN: usize = 4;
 
     // output the final compacted file (must still be .tmp) include the directory
-    async fn compact(&mut self, id: usize, dir: &PathBuf) -> CompactionResult<String> {
+    async fn compact(
+        &mut self,
+        id: usize,
+        dir: &PathBuf,
+        output_level: u8,
+    ) -> CompactionResult<String> {
         if self.target_files.is_empty() {
             return Err(CompactionError::CompactionIoError(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -269,7 +341,7 @@ impl CompactionUnit {
                 let right_kind = Self::table_type_from_name(&right);
                 let left_file = tokio::fs::File::open(dir.join(&left)).await?;
                 let right_file = tokio::fs::File::open(dir.join(&right)).await?;
-                let dest_file = tokio::fs::File::create(dir.join(&out_name)).await?;
+                let mut dest_file = tokio::fs::File::create(dir.join(&out_name)).await?;
                 let left_table = match left_kind {
                     TableTypeKind::SSTable => TableType::SSTable(left_file),
                     TableTypeKind::RawDataSection => TableType::RawDataSection(left_file),
@@ -278,7 +350,7 @@ impl CompactionUnit {
                     TableTypeKind::SSTable => TableType::SSTable(right_file),
                     TableTypeKind::RawDataSection => TableType::RawDataSection(right_file),
                 };
-                Self::join_tables(left_table, &left, right_table, &right, dest_file).await?;
+                Self::join_tables(left_table, &left, right_table, &right, &mut dest_file).await?;
 
                 // Once a source table has been successfully joined, rename first, then mark consumed.
                 let consumed_left = Self::mark_drained_file(dir, &left).await?;
@@ -306,9 +378,21 @@ impl CompactionUnit {
             ))
         })?;
 
-        let ds = tokio::fs::File::open(dir.join(&data_section)).await?;
-        Self::build_from_data_section(ds).await?;
-        // delete all consumed files
+        let ds = tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(&data_section))
+            .await?;
+        Self::build_from_data_section(ds, output_level).await?;
+        // Delete all consumed source files once the rebuilt output is in place.
+        for consumed in self.consumed_files.drain(..) {
+            let consumed_path = dir.join(&consumed);
+            match tokio::fs::remove_file(&consumed_path).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(CompactionError::CompactionIoError(err)),
+            }
+        }
         Ok(data_section)
     }
     async fn join_tables(
@@ -316,26 +400,291 @@ impl CompactionUnit {
         l_name: &str,
         right: TableType,
         r_name: &str,
-        dest: tokio::fs::File,
+        dest: &mut tokio::fs::File,
     ) -> CompactionResult<()> {
         //validate the table first, crc, footer len, sparse index,
         // keep track of where it should end in memory (know when to stop iterating)
-        let (l_file, l_size) = Self::to_data_section(l_name, left).await?;
-        let (r_file, r_size) = Self::to_data_section(r_name, right).await?;
+        let (mut l_file, l_size) = Self::to_data_section(l_name, left).await?;
+        let (mut r_file, r_size) = Self::to_data_section(r_name, right).await?;
         // ! for now assume that the ss-tables are sorted, ill update this after a working version exist where we check
         // ! prev key < cur_kevy
         // ! only have four keys (at most) in ram at a time.
         // ! left_prev , right_prev, left_cur, right_cur this is to make sure it holds a sorted realationship
-        let left_ptr = 0usize;
-        let right_ptr = 0usize;
+        let mut left_ptr = 0usize;
+        let mut right_ptr = 0usize;
 
-        while left_ptr < l_size && right_ptr < r_size {
-            // always read left first
+        let mut left_entry =
+            Self::read_next_non_tombstone_entry(l_name, &mut l_file, &mut left_ptr, l_size).await?;
+
+        let mut right_entry =
+            Self::read_next_non_tombstone_entry(r_name, &mut r_file, &mut right_ptr, r_size)
+                .await?;
+
+        while left_entry.is_some() && right_entry.is_some() {
+            let ordering = {
+                let (left_key, _) = left_entry.as_ref().unwrap();
+                let (right_key, _) = right_entry.as_ref().unwrap();
+                left_key.cmp(right_key)
+            };
+
+            match ordering {
+                std::cmp::Ordering::Less => {
+                    let (left_key, left_val) = left_entry.take().unwrap();
+                    Self::write_data_section_entry(dest, &left_key, &left_val).await?;
+
+                    left_entry = Self::read_next_non_tombstone_entry(
+                        l_name,
+                        &mut l_file,
+                        &mut left_ptr,
+                        l_size,
+                    )
+                    .await?;
+                }
+                std::cmp::Ordering::Greater => {
+                    let (right_key, right_val) = right_entry.take().unwrap();
+                    Self::write_data_section_entry(dest, &right_key, &right_val).await?;
+
+                    right_entry = Self::read_next_non_tombstone_entry(
+                        r_name,
+                        &mut r_file,
+                        &mut right_ptr,
+                        r_size,
+                    )
+                    .await?;
+                }
+                std::cmp::Ordering::Equal => {
+                    // Equal keys: prefer the newer record (left input), and advance both sides.
+                    let (left_key, left_val) = left_entry.take().unwrap();
+                    let _ = right_entry.take().unwrap();
+                    Self::write_data_section_entry(dest, &left_key, &left_val).await?;
+
+                    left_entry = Self::read_next_non_tombstone_entry(
+                        l_name,
+                        &mut l_file,
+                        &mut left_ptr,
+                        l_size,
+                    )
+                    .await?;
+                    right_entry = Self::read_next_non_tombstone_entry(
+                        r_name,
+                        &mut r_file,
+                        &mut right_ptr,
+                        r_size,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        while let Some((left_key, left_val)) = left_entry.take() {
+            Self::write_data_section_entry(dest, &left_key, &left_val).await?;
+            left_entry =
+                Self::read_next_non_tombstone_entry(l_name, &mut l_file, &mut left_ptr, l_size)
+                    .await?;
+        }
+
+        while let Some((right_key, right_val)) = right_entry.take() {
+            Self::write_data_section_entry(dest, &right_key, &right_val).await?;
+            right_entry =
+                Self::read_next_non_tombstone_entry(r_name, &mut r_file, &mut right_ptr, r_size)
+                    .await?;
         }
 
         Ok(())
     }
-    async fn build_from_data_section(source: tokio::fs::File) -> CompactionResult<()> {
+    async fn read_prefixed_bytes(
+        file_name: &str,
+        file_ptr: &mut tokio::fs::File,
+    ) -> CompactionResult<(Vec<u8>, usize)> {
+        let mut size_buffer = [0u8; 4];
+        file_ptr.read_exact(&mut size_buffer).await?;
+        let value_size = u32::from_le_bytes(size_buffer) as usize;
+        let mut value_buffer = vec![0u8; value_size];
+        file_ptr.read_exact(&mut value_buffer).await?;
+
+        if value_buffer.len() != value_size {
+            return Err(CompactionError::InvalidTable(
+                String::from(file_name),
+                TableCorruption::DataSectionError(
+                    "length prefix did not match decoded data size".to_string(),
+                ),
+            ));
+        }
+
+        Ok((value_buffer, 4 + value_size))
+    }
+    async fn read_data_section_entry(
+        file_name: &str,
+        file_ptr: &mut tokio::fs::File,
+    ) -> CompactionResult<((Vec<u8>, Vec<u8>), usize)> {
+        let (key, key_bytes) = Self::read_prefixed_bytes(file_name, file_ptr).await?;
+        let (value, value_bytes) = Self::read_prefixed_bytes(file_name, file_ptr).await?;
+        Ok(((key, value), key_bytes + value_bytes))
+    }
+    async fn read_next_non_tombstone_entry(
+        file_name: &str,
+        file_ptr: &mut tokio::fs::File,
+        ptr: &mut usize,
+        section_size: usize,
+    ) -> CompactionResult<Option<(Vec<u8>, Vec<u8>)>> {
+        while *ptr < section_size {
+            let ((key, value), bytes_read) =
+                Self::read_data_section_entry(file_name, file_ptr).await?;
+            *ptr += bytes_read;
+
+            if Self::is_tombstone(key.clone(), value.clone()) {
+                continue;
+            }
+
+            return Ok(Some((key, value)));
+        }
+
+        Ok(None)
+    }
+    async fn write_data_section_entry(
+        dest: &mut tokio::fs::File,
+        key: &[u8],
+        value: &[u8],
+    ) -> CompactionResult<()> {
+        let key_len = u32::try_from(key.len()).map_err(|_| {
+            CompactionError::InvalidTable(
+                "compaction-output".to_string(),
+                TableCorruption::DataSectionError("key length exceeds u32".to_string()),
+            )
+        })?;
+        let value_len = u32::try_from(value.len()).map_err(|_| {
+            CompactionError::InvalidTable(
+                "compaction-output".to_string(),
+                TableCorruption::DataSectionError("value length exceeds u32".to_string()),
+            )
+        })?;
+
+        dest.write_all(&key_len.to_le_bytes()).await?;
+        dest.write_all(key).await?;
+        dest.write_all(&value_len.to_le_bytes()).await?;
+        dest.write_all(value).await?;
+        Ok(())
+    }
+    async fn build_from_data_section(
+        mut source: tokio::fs::File,
+        level: u8,
+    ) -> CompactionResult<()> {
+        source.seek(std::io::SeekFrom::Start(0)).await?;
+        let mut data_section = Vec::new();
+        source.read_to_end(&mut data_section).await?;
+
+        let block_stride = 64 * 1024 * std::cmp::max(1usize, level as usize); // 64kb * level -> larger levels have more data so index becomes more sparse
+        let mut sparse_index: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut max_key: Vec<u8> = Vec::new();
+
+        let mut cursor = 0usize;
+        let mut bytes_since_sparse_mark = 0usize;
+        while cursor < data_section.len() {
+            let entry_start = cursor;
+
+            if cursor + 4 > data_section.len() {
+                return Err(CompactionError::CompactionIoError(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid key length prefix in data section",
+                )));
+            }
+            let key_len =
+                u32::from_le_bytes(data_section[cursor..cursor + 4].try_into().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid key length bytes")
+                })?) as usize;
+            cursor += 4;
+
+            if cursor + key_len > data_section.len() {
+                return Err(CompactionError::CompactionIoError(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "key length exceeds remaining data section bytes",
+                )));
+            }
+            let key = data_section[cursor..cursor + key_len].to_vec();
+            cursor += key_len;
+
+            if cursor + 4 > data_section.len() {
+                return Err(CompactionError::CompactionIoError(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid value length prefix in data section",
+                )));
+            }
+            let value_len =
+                u32::from_le_bytes(data_section[cursor..cursor + 4].try_into().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid value length bytes")
+                })?) as usize;
+            cursor += 4;
+
+            if cursor + value_len > data_section.len() {
+                return Err(CompactionError::CompactionIoError(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "value length exceeds remaining data section bytes",
+                )));
+            }
+            cursor += value_len;
+
+            let traversed_entry_bytes = cursor - entry_start;
+            if sparse_index.is_empty() || bytes_since_sparse_mark >= block_stride {
+                sparse_index.push((entry_start as u64, key.clone()));
+                bytes_since_sparse_mark = 0;
+            }
+            bytes_since_sparse_mark += traversed_entry_bytes;
+            max_key = key;
+        }
+
+        let mut sparse_index_bytes = Vec::new();
+        for (offset, key) in &sparse_index {
+            let key_len = u32::try_from(key.len()).map_err(|_| {
+                CompactionError::CompactionIoError(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sparse index key length exceeds u32",
+                ))
+            })?;
+            sparse_index_bytes.extend_from_slice(&key_len.to_le_bytes());
+            sparse_index_bytes.extend_from_slice(key);
+            sparse_index_bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+
+        let mut footer = Vec::new();
+        let max_key_len = u32::try_from(max_key.len()).map_err(|_| {
+            CompactionError::CompactionIoError(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "max key length exceeds u32",
+            ))
+        })?;
+        footer.extend_from_slice(&max_key_len.to_le_bytes());
+        footer.extend_from_slice(&max_key);
+
+        let trailing_bloom = vec![0u8; super::disk::BLOOM_FILTER_SIZE];
+        let footer_size = u64::try_from(footer.len() + trailing_bloom.len()).map_err(|_| {
+            CompactionError::CompactionIoError(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "footer size exceeds u64",
+            ))
+        })?;
+        let sparse_index_size = u32::try_from(sparse_index_bytes.len()).map_err(|_| {
+            CompactionError::CompactionIoError(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sparse index size exceeds u32",
+            ))
+        })?;
+
+        let mut output = Vec::new();
+        output.extend_from_slice(super::disk::HEADER_CRC.as_bytes());
+        output.extend_from_slice(&footer_size.to_le_bytes());
+        // Reserved bloom-filter bytes after footer-size field.
+        output.extend_from_slice(&vec![0u8; super::disk::BLOOM_FILTER_SIZE]);
+        output.extend_from_slice(&sparse_index_size.to_le_bytes());
+        output.extend_from_slice(&sparse_index_bytes);
+        output.extend_from_slice(&data_section);
+        output.extend_from_slice(&footer);
+        // Reserved bloom-filter bytes appended after footer for later bloom work.
+        output.extend_from_slice(&trailing_bloom);
+
+        source.set_len(0).await?;
+        source.seek(std::io::SeekFrom::Start(0)).await?;
+        source.write_all(&output).await?;
+        source.flush().await?;
         Ok(())
     }
 
@@ -465,38 +814,203 @@ impl ComapctionCofig {
 #[cfg(test)]
 mod compaction_unit_test {
     use super::*;
+    use std::path::Path;
 
     const DIRECTORY: &str = "test-data";
 
-    #[tokio::test]
-    #[ignore = "fill in a real ss-table file name before running"]
-    async fn to_data_section_reads_sstable_offsets() {
-        let file_name = "ss-table-entry_5b99f04b-1272-4d1c-8f21-44522e12d3a4.bin";
-        let path = std::path::Path::new(DIRECTORY).join(file_name);
-        println!("path : {}", path.display());
-        let file = tokio::fs::File::open(&path)
+    async fn pick_two_sstable_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+        let mut read_dir = tokio::fs::read_dir(DIRECTORY)
             .await
-            .expect("fill in a valid ss-table path before running this test");
+            .expect("expected test-data directory to exist");
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
 
-        let (mut data_section, data_section_size) = CompactionUnit::to_data_section(
-            path.to_str().unwrap_or(file_name),
-            TableType::SSTable(file),
+        while let Some(entry) = read_dir
+            .next_entry()
+            .await
+            .expect("expected test-data directory to be readable")
+        {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("bin") {
+                paths.push(path);
+            }
+        }
+
+        paths.sort();
+        assert!(
+            paths.len() >= 2,
+            "expected at least two .bin SSTables in test-data, found {}",
+            paths.len()
+        );
+        (paths[0].clone(), paths[1].clone())
+    }
+
+    #[tokio::test]
+    async fn join_tables_file1_file2_output_is_sorted() {
+        let (file1_path, file2_path) = pick_two_sstable_paths().await;
+        let file1_source = file1_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("expected utf-8 file1 name")
+            .to_string();
+        let file2_source = file2_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("expected utf-8 file2 name")
+            .to_string();
+
+        println!("file1 source: {}", file1_source);
+        println!("file2 source: {}", file2_source);
+
+        let output_path = Path::new(DIRECTORY).join("join-tables-output.tmp");
+        if output_path.exists() {
+            tokio::fs::remove_file(&output_path)
+                .await
+                .expect("expected old output to be removable");
+        }
+
+        let mut dest = tokio::fs::File::create(&output_path)
+            .await
+            .expect("expected destination file to be created");
+
+        CompactionUnit::join_tables(
+            TableType::SSTable(
+                tokio::fs::File::open(&file1_path)
+                    .await
+                    .expect("expected file1 to open"),
+            ),
+            "file1",
+            TableType::SSTable(
+                tokio::fs::File::open(&file2_path)
+                    .await
+                    .expect("expected file2 to open"),
+            ),
+            "file2",
+            &mut dest,
         )
         .await
-        .expect("expected valid ss-table layout");
+        .expect("expected join_tables to complete");
+        drop(dest);
 
-        let cursor = data_section
-            .stream_position()
+        let mut out_file = tokio::fs::File::open(&output_path)
             .await
-            .expect("expected data-section cursor position");
+            .expect("expected merged output to open");
+        let out_size = out_file
+            .metadata()
+            .await
+            .expect("expected merged output metadata")
+            .len() as usize;
 
+        let mut ptr = 0usize;
+        let mut keys: Vec<String> = Vec::new();
+        while ptr < out_size {
+            let ((key, value), bytes_read) =
+                CompactionUnit::read_data_section_entry("join-tables-output.tmp", &mut out_file)
+                    .await
+                    .expect("expected merged output entry to be readable");
+            ptr += bytes_read;
+            let printable_key =
+                String::from_utf8(key.clone()).expect("expected ascii superhero key");
+            println!("merged key: {}", printable_key);
+
+            assert!(
+                !CompactionUnit::is_tombstone(key, value),
+                "merged output contains tombstone for key: {}",
+                printable_key
+            );
+
+            keys.push(printable_key);
+        }
+
+        assert_eq!(ptr, out_size, "expected to consume the full merged output");
+
+        for pair in keys.windows(2) {
+            assert!(
+                pair[0] <= pair[1],
+                "expected sorted merged keys, but {:?} came before {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        tokio::fs::remove_file(&output_path)
+            .await
+            .expect("expected merged output to be removable");
+    }
+
+    #[tokio::test]
+    async fn join_tables_writes_named_result_file() {
+        let file1 = "ss-table-entry_53dc8580-214d-47e9-836d-0f9314646c70.bin";
+        let file2 = "ss-table-entry_ed7076c2-e0c2-4ab1-a1d0-f0e46802a980.bin";
+        let file1_path = Path::new(DIRECTORY).join(file1);
+        let file2_path = Path::new(DIRECTORY).join(file2);
+        let output_path = Path::new(DIRECTORY).join("join_ss-table_result");
+
+        if output_path.exists() {
+            tokio::fs::remove_file(&output_path)
+                .await
+                .expect("expected old join_ss-table_result to be removable");
+        }
+
+        let mut dest = tokio::fs::File::create(&output_path)
+            .await
+            .expect("expected join_ss-table_result to be created");
+
+        CompactionUnit::join_tables(
+            TableType::SSTable(
+                tokio::fs::File::open(&file1_path)
+                    .await
+                    .expect("expected file1 to open"),
+            ),
+            "file1",
+            TableType::SSTable(
+                tokio::fs::File::open(&file2_path)
+                    .await
+                    .expect("expected file2 to open"),
+            ),
+            "file2",
+            &mut dest,
+        )
+        .await
+        .expect("expected join_tables to write result file");
+        drop(dest);
+
+        let size = tokio::fs::metadata(&output_path)
+            .await
+            .expect("expected output metadata")
+            .len();
+        assert!(size > 0, "expected join_ss-table_result to be non-empty");
+
+        println!("wrote merged output to {}", output_path.display());
+    }
+
+    #[tokio::test]
+    async fn build_sstable_on_joined_result_file() {
+        let output_path = Path::new(DIRECTORY).join("join_ss-table_result");
         assert!(
-            cursor > 0,
-            "expected cursor to be positioned past the sstable metadata"
+            output_path.exists(),
+            "expected join_ss-table_result to exist before building sstable"
         );
+
+        let file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&output_path)
+            .await
+            .expect("expected join_ss-table_result to open");
+
+        CompactionUnit::build_from_data_section(file, 2)
+            .await
+            .expect("expected sstable build to succeed on join_ss-table_result");
+
+        let size = tokio::fs::metadata(&output_path)
+            .await
+            .expect("expected rebuilt output metadata")
+            .len();
         assert!(
-            data_section_size > 0,
-            "expected the extracted data section size to be greater than zero"
+            size > 0,
+            "expected rebuilt join_ss-table_result to remain non-empty"
         );
+
+        println!("rebuilt sstable format at {}", output_path.display());
     }
 }
