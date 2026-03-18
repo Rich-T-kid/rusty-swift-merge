@@ -10,6 +10,7 @@ COPY ./Cargo.toml ./Cargo.lock ./
 # Copy build script and proto files (IMPORTANT!)
 COPY ./build.rs ./build.rs
 COPY ./src/contract.proto ./src/contract.proto
+COPY ./lsm-config.json ./lsm-config.json
 
 # Copy source
 COPY ./src ./src
@@ -18,4 +19,4 @@ COPY ./src ./src
 RUN cargo build --release
 
 EXPOSE 50051
-CMD ["./target/release/switft-merge"]
+CMD ["./target/release/switft-merge", "lsm-config.json"]

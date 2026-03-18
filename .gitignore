@@ -11,6 +11,7 @@ swift-merge/Wal.tmp
 # Ignore data directory and all its contents
 /data/
 data/
+/test-data/
 
 # Ignore all .bin files except the test file
 *.bin
