@@ -87,16 +87,6 @@ impl Lsmdb for MyLsmDb {
     // handle put requests to insert or update data
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<GenericResponse>, Status> {
         let req = request.into_inner();
-        let key_display = &req.key[..min(req.key.len(), 200)];
-        let value_display = &req.value[..min(req.value.len(), 200)];
-        info!(
-            "Put request: key: {:?} ({})\tvalue:{:?} ({})\tmetadata:{:?}\n",
-            key_display,
-            req.key.len(),
-            value_display,
-            req.value.len(),
-            req.metadata
-        );
 
         // Validate request
         validate_put_request(&req)?;
@@ -1738,14 +1728,15 @@ mod integration_tests {
 
 #[cfg(test)]
 mod generate_test_data {
-    use std::clone;
+    use std::time::Duration;
+    use std::{clone, thread};
 
     use super::*;
     use crate::*;
     use tonic::Request;
     use tonic::transport::Channel;
 
-    const SERVER_ADDRESS: &str = "http://127.0.0.1:50051";
+    const SERVER_ADDRESS: &str = "http://104.236.210.9:50051";
 
     #[tokio::test]
     #[ignore]
@@ -1756,151 +1747,162 @@ mod generate_test_data {
         // Connect to gRPC server
         let channel = Channel::from_static(SERVER_ADDRESS).connect().await?;
         let mut client = LsmdbClient::new(channel);
+        let count = 25;
+        for i in 0..count {
+            // Large list of keys to trigger multiple flushes
+            let test_keys = vec![
+                // Superheroes
+                "spider_man",
+                "iron_man",
+                "captain_america",
+                "thor",
+                "hulk",
+                "black_widow",
+                "hawkeye",
+                "doctor_strange",
+                "black_panther",
+                "ant_man",
+                "wasp",
+                "vision",
+                "scarlet_witch",
+                "winter_soldier",
+                "falcon",
+                "war_machine",
+                "star_lord",
+                "gamora",
+                "drax",
+                "rocket_raccoon",
+                "groot",
+                "mantis",
+                "nebula",
+                "loki",
+                "valkyrie",
+                // Villains
+                "thanos",
+                "ultron",
+                "red_skull",
+                "hela",
+                "killmonger",
+                "vulture",
+                "mysterio",
+                "green_goblin",
+                "doc_ock",
+                "venom",
+                "carnage",
+                "magneto",
+                "mystique",
+                "juggernaut",
+                "sabretooth",
+                // X-Men
+                "wolverine",
+                "cyclops",
+                "jean_grey",
+                "storm",
+                "rogue",
+                "beast",
+                "nightcrawler",
+                "colossus",
+                "kitty_pryde",
+                "iceman",
+                "angel",
+                "professor_x",
+                "gambit",
+                "jubilee",
+                "psylocke",
+                // Fantastic Four
+                "mr_fantastic",
+                "invisible_woman",
+                "human_torch",
+                "the_thing",
+                // Street Level
+                "daredevil",
+                "punisher",
+                "luke_cage",
+                "iron_fist",
+                "jessica_jones",
+                "elektra",
+                "blade",
+                "moon_knight",
+                "ghost_rider",
+                "deadpool",
+                // Cosmic
+                "silver_surfer",
+                "galactus",
+                "nova",
+                "captain_marvel",
+                "ms_marvel",
+                "adam_warlock",
+                "quasar",
+                "beta_ray_bill",
+                // More heroes to trigger multiple flushes
+                "she_hulk",
+                "hawkgirl",
+                "aquaman",
+                "flash",
+                "green_lantern",
+                "cyborg",
+                "martian_manhunter",
+                "wonder_woman",
+                "superman",
+                "batman",
+                "nightwing",
+                "robin",
+                "batgirl",
+                "supergirl",
+                "shazam",
+                "plastic_man",
+                "atom",
+                "firestorm",
+                "booster_gold",
+                "blue_beetle",
+            ];
 
-        // Large list of keys to trigger multiple flushes
-        let test_keys = vec![
-            // Superheroes
-            "spider_man",
-            "iron_man",
-            "captain_america",
-            "thor",
-            "hulk",
-            "black_widow",
-            "hawkeye",
-            "doctor_strange",
-            "black_panther",
-            "ant_man",
-            "wasp",
-            "vision",
-            "scarlet_witch",
-            "winter_soldier",
-            "falcon",
-            "war_machine",
-            "star_lord",
-            "gamora",
-            "drax",
-            "rocket_raccoon",
-            "groot",
-            "mantis",
-            "nebula",
-            "loki",
-            /*"valkyrie",
-            // Villains
-            "thanos",
-            "ultron",
-            "red_skull",
-            "hela",
-            "killmonger",
-            "vulture",
-            "mysterio",
-            "green_goblin",
-            "doc_ock",
-            "venom",
-            "carnage",
-            "magneto",
-            "mystique",
-            "juggernaut",
-            "sabretooth",
-            // X-Men
-            "wolverine",
-            "cyclops",
-            "jean_grey",
-            "storm",
-            "rogue",
-            "beast",
-            "nightcrawler",
-            "colossus",
-            "kitty_pryde",
-            "iceman",
-            "angel",
-            "professor_x",
-            "gambit",
-            "jubilee",
-            "psylocke",
-            // Fantastic Four
-            "mr_fantastic",
-            "invisible_woman",
-            "human_torch",
-            "the_thing",
-            // Street Level
-            "daredevil",
-            "punisher",
-            "luke_cage",
-            "iron_fist",
-            "jessica_jones",
-            "elektra",
-            "blade",
-            "moon_knight",
-            "ghost_rider",
-            "deadpool",
-            // Cosmic
-            "silver_surfer",
-            "galactus",
-            "nova",
-            "captain_marvel",
-            "ms_marvel",
-            "adam_warlock",
-            "quasar",
-            "beta_ray_bill",
-            // More heroes to trigger multiple flushes
-            "she_hulk",
-            "hawkgirl",
-            "aquaman",
-            "flash",
-            "green_lantern",
-            "cyborg",
-            "martian_manhunter",
-            "wonder_woman",
-            "superman",
-            "batman",
-            "nightwing",
-            "robin",
-            "batgirl",
-            "supergirl",
-            "shazam",
-            "plastic_man",
-            "atom",
-            "firestorm",
-            "booster_gold",
-            "blue_beetle",*/
-        ];
+            // Create 10KB zero'd out value
+            let size = match i {
+                0 => 10_000,
+                1 => 100_000,
+                2 => 500_000,
+                3 => 1_000_000,
+                _ => 2_000_000,
+            };
+            println!("batch {i} is of size: {size}");
+            let power_data = vec![0u8; size];
 
-        // Create 10KB zero'd out value
-        let power_data = vec![0u8; 10_000];
+            println!("Starting to insert {} entries via gRPC...", test_keys.len());
 
-        println!("Starting to insert {} entries via gRPC...", test_keys.len());
+            for (idx, hero) in test_keys.iter().enumerate() {
+                let request = Request::new(PutRequest {
+                    key: hero.as_bytes().to_vec(),
+                    value: power_data.clone(),
+                    metadata: std::collections::HashMap::new(),
+                });
 
-        for (idx, hero) in test_keys.iter().enumerate() {
-            let request = Request::new(PutRequest {
-                key: hero.as_bytes().to_vec(),
-                value: power_data.clone(),
-                metadata: std::collections::HashMap::new(),
-            });
-
-            match client.put(request).await {
-                Ok(response) => {
-                    if idx % 10 == 0 {
-                        println!("Inserted {} entries so far", idx);
+                match client.put(request).await {
+                    Ok(response) => {
+                        if idx % 10 == 0 {
+                            println!("Inserted {} entries so far", idx);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to insert '{}': {}", hero, e);
                     }
                 }
-                Err(e) => {
-                    eprintln!("Failed to insert '{}': {}", hero, e);
-                }
             }
+
+            /*
+            client
+                .delete(Request::new(DeleteRequest {
+                    key: "drax".as_bytes().to_vec(),
+                }))
+                .await?;
+            */
+
+            println!("\n=== Test Data Generation Complete ===");
+            println!("Total keys inserted: {}", test_keys.len());
+            println!("batch {} completed sleeping for 7 seconds", i);
+
+            thread::sleep(Duration::from_secs(5));
         }
-        /*
-        client
-            .delete(Request::new(DeleteRequest {
-                key: "drax".as_bytes().to_vec(),
-            }))
-            .await?;
-        */
-
-        println!("\n=== Test Data Generation Complete ===");
-        println!("Total keys inserted: {}", test_keys.len());
-        println!("Check data/l1/ directory for generated SS-table files");
-        println!("Server should have triggered multiple flushes based on ram_max_size config");
-
         Ok(())
     }
 }
