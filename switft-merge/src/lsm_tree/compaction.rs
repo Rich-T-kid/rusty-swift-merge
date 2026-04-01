@@ -55,7 +55,6 @@ impl CompactionCoordinator {
                 .or_insert_with(Vec::new)
                 .push(func);
         }
-        // generate a seperate thread that will do the monitoring
         Self {
             update_funcs,
             config: ComapctionCofig::new(&config),
