@@ -539,7 +539,7 @@ pub async fn run_server(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "grpc-integration-tests"))]
 mod integration_tests {
     use tonic::transport::Channel;
 

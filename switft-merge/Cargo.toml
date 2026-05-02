@@ -3,6 +3,11 @@ name = "switft-merge"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# Run with: cargo test --features grpc-integration-tests (requires server on localhost:50051)
+grpc-integration-tests = []
+
 [dependencies]
 rand = "0.9.2"
 tonic = "0.12"
