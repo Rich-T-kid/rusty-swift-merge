@@ -172,7 +172,15 @@ impl CompactionCoordinator {
         // Each unit returns one final merged .tmp file.
         let mut compacted_tmp_files = Vec::new();
         for (id, unit) in compaction_units.iter_mut().enumerate() {
-            match unit.compact(id, dir, dir_level + 1).await {
+            match unit
+                .compact(
+                    id,
+                    dir,
+                    dir_level + 1,
+                    self.config.bloom_false_positive_rate,
+                )
+                .await
+            {
                 Ok(result) => compacted_tmp_files.push(result),
                 Err(e) => log::error!("Compaction unit: {} failed: {:?}", id, e),
             }
@@ -341,6 +349,7 @@ impl CompactionUnit {
         id: usize,
         dir: &PathBuf,
         output_level: u8,
+        bloom_false_positive_rate: f64,
     ) -> CompactionResult<String> {
         if self.target_files.is_empty() {
             return Err(CompactionError::CompactionIoError(io::Error::new(
@@ -410,7 +419,7 @@ impl CompactionUnit {
             .write(true)
             .open(dir.join(&data_section))
             .await?;
-        Self::build_from_data_section(ds, output_level).await?;
+        Self::build_from_data_section(ds, output_level, bloom_false_positive_rate).await?;
         // Delete all consumed source files once the rebuilt output is in place.
         for consumed in self.consumed_files.drain(..) {
             let consumed_path = dir.join(&consumed);
@@ -595,6 +604,7 @@ impl CompactionUnit {
     async fn build_from_data_section(
         mut source: tokio::fs::File,
         level: u8,
+        bloom_false_positive_rate: f64,
     ) -> CompactionResult<()> {
         source.seek(std::io::SeekFrom::Start(0)).await?;
         let mut data_section = Vec::new();
@@ -603,6 +613,7 @@ impl CompactionUnit {
         let block_stride = 64 * 1024 * std::cmp::max(1usize, level as usize); // 64kb * level -> larger levels have more data so index becomes more sparse
         let mut sparse_index: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut max_key: Vec<u8> = Vec::new();
+        let mut bloom_keys: Vec<Vec<u8>> = Vec::new();
 
         let mut cursor = 0usize;
         let mut bytes_since_sparse_mark = 0usize;
@@ -629,6 +640,7 @@ impl CompactionUnit {
             }
             let key = data_section[cursor..cursor + key_len].to_vec();
             cursor += key_len;
+            bloom_keys.push(key.clone());
 
             if cursor + 4 > data_section.len() {
                 return Err(CompactionError::CompactionIoError(io::Error::new(
@@ -682,8 +694,11 @@ impl CompactionUnit {
         footer.extend_from_slice(&max_key_len.to_le_bytes());
         footer.extend_from_slice(&max_key);
 
-        let trailing_bloom = vec![0u8; super::disk::BLOOM_FILTER_SIZE];
-        let footer_size = u64::try_from(footer.len() + trailing_bloom.len()).map_err(|_| {
+        let bloom_block = super::disk::BloomGenerator::generate_filter_from_keys(
+            &bloom_keys,
+            bloom_false_positive_rate,
+        );
+        let footer_size = u64::try_from(footer.len()).map_err(|_| {
             CompactionError::CompactionIoError(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "footer size exceeds u64",
@@ -699,14 +714,11 @@ impl CompactionUnit {
         let mut output = Vec::new();
         output.extend_from_slice(super::disk::HEADER_CRC.as_bytes());
         output.extend_from_slice(&footer_size.to_le_bytes());
-        // Reserved bloom-filter bytes after footer-size field.
-        output.extend_from_slice(&vec![0u8; super::disk::BLOOM_FILTER_SIZE]);
+        output.extend_from_slice(&bloom_block);
         output.extend_from_slice(&sparse_index_size.to_le_bytes());
         output.extend_from_slice(&sparse_index_bytes);
         output.extend_from_slice(&data_section);
         output.extend_from_slice(&footer);
-        // Reserved bloom-filter bytes appended after footer for later bloom work.
-        output.extend_from_slice(&trailing_bloom);
 
         source.set_len(0).await?;
         source.seek(std::io::SeekFrom::Start(0)).await?;
@@ -826,6 +838,7 @@ struct ComapctionCofig {
     max_compaction_threads: u8,
     target_chunks: u8,
     local_disk: bool, // ignore this for now
+    bloom_false_positive_rate: f64,
 }
 impl ComapctionCofig {
     fn new(config: &ConfigInfo) -> Self {
@@ -834,6 +847,7 @@ impl ComapctionCofig {
             max_compaction_threads: config.max_compaction_threads,
             target_chunks: config.target_chunks,
             local_disk: config.local_disk,
+            bloom_false_positive_rate: config.bloom_false_positive_rate,
         }
     }
 }
@@ -1028,7 +1042,7 @@ mod compaction_unit_test {
             .await
             .expect("expected join_ss-table_result to open");
 
-        CompactionUnit::build_from_data_section(file, 2)
+        CompactionUnit::build_from_data_section(file, 2, 0.01)
             .await
             .expect("expected sstable build to succeed on join_ss-table_result");
 

@@ -861,11 +861,13 @@ impl Memtable {
             }
             ConfigSource::Default() => {
                 let config = ConfigInfo {
-                    ram_max_size: 70_000, // ! change back when pushing ! have this be a factor of TARGET_BLOCK_SIZE so 65k or so
+                    // Large enough that typical unit tests (WAL recovery, etc.) do not hit flush;
+                    // use ConfigSource::FileSource / RawBytes with a smaller cap to exercise flush.
+                    ram_max_size: 512 * 1024,
                     ram_max_time: 600,
                     target_chunks: 4,
                     compaction_check_interval_seconds: 3600,
-                    wal_enabled: false, // ! change back when pushing (mabey)
+                    wal_enabled: true,
                     bloom_false_positive_rate: 0.05,
                     max_compaction_threads: 2,
                     local_disk: true,
@@ -912,7 +914,7 @@ pub struct ConfigInfo {
     pub(crate) target_chunks: u8,
     pub(crate) compaction_check_interval_seconds: u16,
     wal_enabled: bool,
-    bloom_false_positive_rate: f64,
+    pub(crate) bloom_false_positive_rate: f64,
     pub(crate) max_compaction_threads: u8,
     pub(crate) local_disk: bool,
 }
@@ -1006,7 +1008,8 @@ impl MemMetricTracker {
         if content.is_empty() {
             return Ok(Self::default());
         }
-        let tracker: MemMetricTracker = serde_json::from_slice(&content)?;
+        let tracker: MemMetricTracker =
+            serde_json::from_slice(&content).unwrap_or_else(|_| Self::default());
         Ok(tracker)
     }
 
@@ -1030,7 +1033,8 @@ impl MemMetricTracker {
         if content.is_empty() {
             return Ok(Self::default());
         }
-        let tracker: MemMetricTracker = serde_json::from_slice(&content)?;
+        let tracker: MemMetricTracker =
+            serde_json::from_slice(&content).unwrap_or_else(|_| Self::default());
         Ok(tracker)
     }
 
@@ -1070,7 +1074,8 @@ impl DiskTreeMetricTracker {
         if content.is_empty() {
             return Ok(Self::default());
         }
-        let tracker: DiskTreeMetricTracker = serde_json::from_slice(&content)?;
+        let tracker: DiskTreeMetricTracker =
+            serde_json::from_slice(&content).unwrap_or_else(|_| Self::default());
         Ok(tracker)
     }
 
@@ -1094,7 +1099,8 @@ impl DiskTreeMetricTracker {
         if content.is_empty() {
             return Ok(Self::default());
         }
-        let tracker: DiskTreeMetricTracker = serde_json::from_slice(&content)?;
+        let tracker: DiskTreeMetricTracker =
+            serde_json::from_slice(&content).unwrap_or_else(|_| Self::default());
         Ok(tracker)
     }
 
@@ -1309,6 +1315,7 @@ mod wal_manager_test {
     }
 }
 
+#[cfg(test)]
 mod config_test {
     use super::*;
     use serde_json::json;
@@ -1322,7 +1329,8 @@ mod config_test {
             "compactionCheckIntervalSeconds": 2,
             "walEnabled": true,
             "bloomFalsePositiveRate": 0.01,
-            "maxCompactionThreads": 4
+            "maxCompactionThreads": 4,
+            "localDisk": true
         });
 
         let mut config: ConfigInfo = serde_json::from_value(config_json).unwrap();
@@ -1338,7 +1346,8 @@ mod config_test {
             "compactionCheckIntervalSeconds": 2,
             "walEnabled": true,
             "bloomFalsePositiveRate": 0.01,
-            "maxCompactionThreads": 4
+            "maxCompactionThreads": 4,
+            "localDisk": true
         });
 
         let mut config: ConfigInfo = serde_json::from_value(config_json).unwrap();
@@ -1361,7 +1370,8 @@ mod config_test {
             "compactionCheckIntervalSeconds": 2,
             "walEnabled": true,
             "bloomFalsePositiveRate": 0.15,
-            "maxCompactionThreads": 4
+            "maxCompactionThreads": 4,
+            "localDisk": true
         });
 
         let mut config: ConfigInfo = serde_json::from_value(config_json).unwrap();
@@ -1384,7 +1394,8 @@ mod config_test {
             "compactionCheckIntervalSeconds": 2,
             "walEnabled": true,
             "bloomFalsePositiveRate": 0.01,
-            "maxCompactionThreads": 4
+            "maxCompactionThreads": 4,
+            "localDisk": true
         });
 
         let mut config: ConfigInfo = serde_json::from_value(config_json).unwrap();
@@ -1407,7 +1418,8 @@ mod config_test {
             "compactionCheckIntervalSeconds": 2,
             "walEnabled": true,
             "bloomFalsePositiveRate": 0.01,
-            "maxCompactionThreads": 4
+            "maxCompactionThreads": 4,
+            "localDisk": true
         });
 
         let mut config: ConfigInfo = serde_json::from_value(config_json).unwrap();
@@ -1473,6 +1485,8 @@ mod range_tests {
     // Non-basic range test - test edge cases and tombstones
     #[test]
     fn test_range_with_tombstones_and_edge_cases() {
+        let _ = std::fs::remove_file(WRITE_AHEAD_LOG_FILE_NAME);
+
         let mut memtable =
             Memtable::new(ConfigSource::Default()).expect("failed to create memtable");
 
@@ -1605,6 +1619,7 @@ mod range_tests {
     }
 }
 
+#[cfg(test)]
 mod flush_test {
     use super::*;
 

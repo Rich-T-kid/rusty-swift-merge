@@ -795,6 +795,8 @@ mod deserialize_test {
 
         #[test]
         fn test_memtable_persists_after_drop() {
+            let _ = std::fs::remove_file(crate::memtable::mem::WRITE_AHEAD_LOG_FILE_NAME);
+
             // Create first memtable and insert values
             let mut mg = Memtable::new(ConfigSource::Default()).unwrap();
 
@@ -880,6 +882,9 @@ mod deserialize_test {
                 let result = mg2.get(key.as_bytes()).unwrap();
                 assert!(result.is_some(), "Key {} should exist after recovery", key);
             }
+
+            drop(mg2);
+            let _ = std::fs::remove_file(crate::memtable::mem::WRITE_AHEAD_LOG_FILE_NAME);
         }
     }
 }

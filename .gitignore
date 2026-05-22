@@ -6,7 +6,7 @@ switft-merge/target/
 switft-merge/tmp/**
 switft-merge/tmp/
 switft-merge/test_metrics/**
-swift-merge/Wal.tmp
+switft-merge/Wal.tmp
 
 # Ignore data directory and all its contents
 /data/
